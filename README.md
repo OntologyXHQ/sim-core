@@ -25,12 +25,15 @@ This repository intentionally contains **no Node.js binding, UI, OXFlow source, 
 - bounded execution policy with timeout, cancellation, input/output/log limits and child cleanup
 - built-in four-state digital event engine with constants, clocks, combinational gates and propagation delay
 - ngspice/XSPICE digital adapter with VCD-normalized event waveforms and reference-engine parity proofs
+- sequential digital primitives: D/SR latches and D/JK/T/SR flip-flops
+- tri-state outputs, four-state multi-driver resolution, and width-aware logic vectors
+- mux/demux/decoder, registers, and counters as canonical bus-oriented digital primitives
 
 ## Install
 
 ```toml
 [dependencies]
-ontologyx-sim-core = "0.7"
+ontologyx-sim-core = "0.8"
 ```
 
 Real analog simulation currently requires `ngspice` on `PATH`.
@@ -123,6 +126,12 @@ XSPICE basic digital gates impose a minimum representable rise/fall delay. Sim C
 this as `XSPICE_MIN_DELAY_SECONDS` and emits an `xspice_delay_floor` diagnostic when a
 smaller requested gate delay is clamped. The built-in `DigitalEngine` remains the semantic
 reference and supports true zero-delay events.
+
+R3 is complete in the built-in engine: sequential storage, tri-state/multi-driver resolution,
+logic vectors up to 64 bits, mux/demux/decoder, registers, and counters all share the same
+event queue and normalized waveform model. The XSPICE adapter provides parity for the native
+XSPICE subset (`d_tristate`, `d_dff`, `d_jkff`, `d_srff`, `d_dlatch`) plus the combinational
+gate set; higher-level bus primitives remain solver-independent reference-engine constructs.
 
 ## Repository contract
 

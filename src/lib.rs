@@ -7,6 +7,8 @@
 //! contract hardening with deterministic result metadata and bounded execution controls.
 //! R3 adds a solver-independent four-state digital event foundation and built-in reference engine.
 //! R3.1 adds an ngspice/XSPICE adapter with VCD-normalized digital waveforms and parity proofs.
+//! R3 completes the digital layer with sequential logic, tri-state/multi-driver resolution,
+//! bus-width primitives, multiplexing, decoding, registers, and counters.
 
 pub mod analysis;
 pub mod circuit;
@@ -24,7 +26,9 @@ pub use circuit::{
     Circuit, Component, ComponentId, ComponentKind, Net, NetEndpoint, NetId, ParameterValue, Pin,
     PinDirection, PinId, SignalDomain,
 };
-pub use digital::{DIGITAL_ENGINE_ID, DigitalEngine, MAX_DIGITAL_EVENTS};
+pub use digital::{
+    DIGITAL_ENGINE_ID, DigitalEngine, LogicVector, MAX_DIGITAL_BUS_WIDTH, MAX_DIGITAL_EVENTS,
+};
 pub use engine::{
     CancellationToken, DEFAULT_EXECUTION_POLL_INTERVAL_MS, DEFAULT_EXECUTION_TIMEOUT_MS,
     DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_OUTPUT_BYTES, EngineCapabilities,

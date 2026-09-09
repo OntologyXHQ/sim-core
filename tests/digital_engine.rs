@@ -239,7 +239,7 @@ fn digital_clock_is_event_driven() {
 }
 
 #[test]
-fn multiple_digital_drivers_fail_validation() {
+fn multiple_digital_drivers_are_resolved_instead_of_rejected() {
     let circuit = Circuit::new()
         .with_component(logic_input("a", LogicValue::Zero))
         .with_component(logic_input("b", LogicValue::One))
@@ -251,13 +251,19 @@ fn multiple_digital_drivers_fail_validation() {
                 .connect(NetEndpoint::new("out", "in")),
         );
     let report = validate_circuit(&circuit);
-    assert!(!report.is_valid());
+    assert!(report.is_valid());
     assert!(
         report
             .issues
             .iter()
-            .any(|issue| issue.code == "multiple_digital_drivers")
+            .any(|issue| issue.code == "multiple_digital_drivers_resolved")
     );
+    let request = digital_request(circuit, NetEndpoint::new("out", "in"), 1e-6);
+    let result = DigitalEngine::new().simulate(&request).unwrap();
+    let Waveform::Digital(waveform) = &result.waveforms[0] else {
+        panic!("expected digital waveform");
+    };
+    assert_eq!(waveform.transitions.last().unwrap().value, LogicValue::X);
 }
 
 #[test]

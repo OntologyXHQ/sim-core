@@ -105,6 +105,42 @@ impl ComponentKind {
     pub fn xnor_gate() -> Self {
         Self::new("xnor_gate")
     }
+    pub fn tri_state_buffer() -> Self {
+        Self::new("tri_state_buffer")
+    }
+    pub fn mux2() -> Self {
+        Self::new("mux2")
+    }
+    pub fn demux2() -> Self {
+        Self::new("demux2")
+    }
+    pub fn decoder2_to_4() -> Self {
+        Self::new("decoder2_to_4")
+    }
+    pub fn d_latch() -> Self {
+        Self::new("d_latch")
+    }
+    pub fn sr_latch() -> Self {
+        Self::new("sr_latch")
+    }
+    pub fn d_flip_flop() -> Self {
+        Self::new("d_flip_flop")
+    }
+    pub fn jk_flip_flop() -> Self {
+        Self::new("jk_flip_flop")
+    }
+    pub fn t_flip_flop() -> Self {
+        Self::new("t_flip_flop")
+    }
+    pub fn sr_flip_flop() -> Self {
+        Self::new("sr_flip_flop")
+    }
+    pub fn register() -> Self {
+        Self::new("register")
+    }
+    pub fn counter() -> Self {
+        Self::new("counter")
+    }
     pub fn diode() -> Self {
         Self::new("diode")
     }

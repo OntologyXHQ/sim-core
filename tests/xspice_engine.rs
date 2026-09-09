@@ -222,3 +222,124 @@ fn real_xspice_matches_reference_clock_through_buffer() {
         assert!((actual.time - expected.time).abs() <= 2e-15);
     }
 }
+
+#[test]
+fn real_xspice_matches_reference_tri_state_resolution() {
+    let Some(xspice) = require_engine() else {
+        return;
+    };
+    let tri = |id: &str| {
+        Component::new(id, ComponentKind::tri_state_buffer())
+            .with_pin(digital_pin("in", PinDirection::Input))
+            .with_pin(digital_pin("enable", PinDirection::Input))
+            .with_pin(digital_pin("out", PinDirection::Output))
+            .with_parameter(
+                "delay",
+                ParameterValue::Quantity(Quantity::new(2e-9, Unit::Second)),
+            )
+    };
+    let circuit = Circuit::new()
+        .with_component(logic_input("a", LogicValue::One))
+        .with_component(logic_input("b", LogicValue::Zero))
+        .with_component(logic_input("ena", LogicValue::One))
+        .with_component(logic_input("enb", LogicValue::Zero))
+        .with_component(tri("ta"))
+        .with_component(tri("tb"))
+        .with_component(sink("out"))
+        .with_net(
+            Net::new("a")
+                .connect(NetEndpoint::new("a", "out"))
+                .connect(NetEndpoint::new("ta", "in")),
+        )
+        .with_net(
+            Net::new("b")
+                .connect(NetEndpoint::new("b", "out"))
+                .connect(NetEndpoint::new("tb", "in")),
+        )
+        .with_net(
+            Net::new("ena")
+                .connect(NetEndpoint::new("ena", "out"))
+                .connect(NetEndpoint::new("ta", "enable")),
+        )
+        .with_net(
+            Net::new("enb")
+                .connect(NetEndpoint::new("enb", "out"))
+                .connect(NetEndpoint::new("tb", "enable")),
+        )
+        .with_net(
+            Net::new("bus")
+                .connect(NetEndpoint::new("ta", "out"))
+                .connect(NetEndpoint::new("tb", "out"))
+                .connect(NetEndpoint::new("out", "in")),
+        );
+    let request = request(circuit, NetEndpoint::new("out", "in"), 20e-9);
+    let reference = DigitalEngine::new().simulate(&request).unwrap();
+    let external = xspice.simulate(&request).unwrap();
+    assert_eq!(last_value(&reference), LogicValue::One);
+    assert_eq!(last_value(&external), last_value(&reference));
+}
+
+#[test]
+fn real_xspice_matches_reference_d_flip_flop_after_causal_clock_edge() {
+    let Some(xspice) = require_engine() else {
+        return;
+    };
+    let dff = Component::new("ff", ComponentKind::d_flip_flop())
+        .with_pin(digital_pin("d", PinDirection::Input))
+        .with_pin(digital_pin("clk", PinDirection::Input))
+        .with_pin(digital_pin("set", PinDirection::Input))
+        .with_pin(digital_pin("reset", PinDirection::Input))
+        .with_pin(digital_pin("q", PinDirection::Output))
+        .with_pin(digital_pin("nq", PinDirection::Output))
+        .with_parameter("initial", ParameterValue::Integer(0))
+        .with_parameter(
+            "delay",
+            ParameterValue::Quantity(Quantity::new(2e-9, Unit::Second)),
+        );
+    let clock = Component::new("clk", ComponentKind::digital_clock())
+        .with_pin(digital_pin("out", PinDirection::Output))
+        .with_parameter(
+            "period",
+            ParameterValue::Quantity(Quantity::new(10e-9, Unit::Second)),
+        )
+        .with_parameter("duty_cycle", ParameterValue::Number(0.5))
+        .with_parameter("initial", ParameterValue::Integer(0));
+    let circuit = Circuit::new()
+        .with_component(logic_input("d", LogicValue::One))
+        .with_component(logic_input("set", LogicValue::Zero))
+        .with_component(logic_input("reset", LogicValue::Zero))
+        .with_component(clock)
+        .with_component(dff)
+        .with_component(sink("out"))
+        .with_net(
+            Net::new("d")
+                .connect(NetEndpoint::new("d", "out"))
+                .connect(NetEndpoint::new("ff", "d")),
+        )
+        .with_net(
+            Net::new("clk")
+                .connect(NetEndpoint::new("clk", "out"))
+                .connect(NetEndpoint::new("ff", "clk")),
+        )
+        .with_net(
+            Net::new("set")
+                .connect(NetEndpoint::new("set", "out"))
+                .connect(NetEndpoint::new("ff", "set")),
+        )
+        .with_net(
+            Net::new("reset")
+                .connect(NetEndpoint::new("reset", "out"))
+                .connect(NetEndpoint::new("ff", "reset")),
+        )
+        .with_net(
+            Net::new("q")
+                .connect(NetEndpoint::new("ff", "q"))
+                .connect(NetEndpoint::new("out", "in")),
+        )
+        .with_net(Net::new("nq").connect(NetEndpoint::new("ff", "nq")));
+    let request = request(circuit, NetEndpoint::new("out", "in"), 20e-9);
+    let reference = DigitalEngine::new().simulate(&request).unwrap();
+    let external = xspice.simulate(&request).unwrap();
+    assert_eq!(last_value(&reference), LogicValue::One);
+    assert_eq!(last_value(&external), LogicValue::One);
+}

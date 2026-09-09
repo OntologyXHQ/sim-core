@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.8.0] - 2026-09-09
+
+### Added
+
+- complete R3 digital subsystem in the pure-Rust `DigitalEngine`
+- D/SR latches and D/JK/T/SR flip-flops with edge selection, async set/reset, initial state, and propagation delay
+- driver-aware digital nets with tri-state release, deterministic same-time resolution, and four-state contention semantics
+- public `LogicVector` bus helper with stable up-to-64-bit conversion
+- canonical `mux2`, `demux2`, `decoder2_to_4`, `register`, and `counter` primitives
+- width-aware register/counter state on the same event-driven execution/runtime limits
+- native XSPICE mappings for `d_tristate`, `d_dff`, `d_jkff`, `d_srff`, and `d_dlatch`
+- full-R3 regression suite covering sequential state, buses, contention, selection logic, registers, and counters
+- XSPICE parity proofs for tri-state resolution and D flip-flop behavior
+
+### Changed
+
+- multiple digital drivers are now resolved instead of rejected; validation emits a warning
+- digital event processing commits same-time driver events as a deterministic bucket before dependent evaluation
+- R3 is now considered complete; subsequent simulation work moves to R4 mixed-signal bridges
+
+
 ## [0.7.0] - 2026-09-09
 
 ### Added

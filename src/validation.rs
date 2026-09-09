@@ -320,10 +320,10 @@ pub fn validate_circuit(circuit: &Circuit) -> ValidationReport {
         }
 
         if domains == BTreeSet::from([SignalDomain::Digital]) && digital_drivers > 1 {
-            report.error(
-                "multiple_digital_drivers",
+            report.warning(
+                "multiple_digital_drivers_resolved",
                 format!("{net_path}.endpoints"),
-                "a pure digital net may have only one output/bidirectional driver in R3.0",
+                "multiple digital drivers are resolved by the event engine using Z/X contention semantics",
             );
         }
 

@@ -100,11 +100,11 @@ claimed by this layer and remains a worker/runtime concern.
 
 ## Digital event contract
 
-R3.0 defines solver-independent four-state digital semantics using `LogicValue::{Zero, One, X, Z}`.
+R3 defines solver-independent four-state digital semantics using `LogicValue::{Zero, One, X, Z}`.
 The built-in `DigitalEngine` is the reference implementation for `Analysis::DigitalTransient`;
 it emits event-based `DigitalWaveform` transitions instead of sampled boolean arrays.
 
-Canonical R3.0 digital components use explicit pin contracts:
+Canonical R3 digital components use explicit pin contracts:
 
 - `logic_input(out)`
 - `digital_clock(out)`
@@ -114,4 +114,15 @@ Canonical R3.0 digital components use explicit pin contracts:
 
 Gate `delay` and clock `period` are seconds (`Unit::Second`). Clock `duty_cycle` is dimensionless.
 Pure digital nets currently reject multiple output/bidirectional drivers; resolved multi-driver/tri-state buses are deferred to a later digital milestone.
-R3.1 adds `XSpiceEngine` as an external backend over ngspice XSPICE. It consumes the same digital Circuit IR, emits the same `DigitalWaveform`, and is parity-tested against `DigitalEngine` for supported logic and timing. XSPICE basic gate models impose a minimum rise/fall delay; Sim Core exposes that boundary as `XSPICE_MIN_DELAY_SECONDS` and reports `xspice_delay_floor` whenever a smaller requested delay is clamped.
+`XSpiceEngine` is the external ngspice/XSPICE backend. It consumes the same Circuit IR and emits the same `DigitalWaveform`. Parity covers the native XSPICE subset: combinational gates, tri-state, D/JK/T/SR flip-flop mappings, and D latch. Higher-level mux/demux/decoder/register/counter behavior remains defined by the solver-independent `DigitalEngine`. XSPICE minimum-delay and ZERO-at-start differences remain explicit diagnostics rather than hidden normalization.
+
+
+## Complete R3 digital contract
+
+`LogicVector` is the canonical width-aware helper for 1..=64 scalar digital bits. Digital nets are
+driver-aware: `Z` releases a net, equal known drivers agree, conflicting known drivers resolve to
+`X`, and an active unknown driver resolves the net to `X`.
+
+Sequential primitives share deterministic event semantics, async set/reset handling, selectable
+rising/falling clock edges in the reference engine, and the same execution-control limits as all
+other simulation work.

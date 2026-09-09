@@ -4,15 +4,64 @@ use std::{
     time::Instant,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    Analysis, AnalysisKind, Circuit, Component, Diagnostic, DigitalTransition, DigitalWaveform,
-    EngineCapabilities, EngineError, EngineId, ExecutionControl, LogicValue, ParameterValue,
-    PinDirection, Probe, Quantity, SignalDomain, SignalId, SimulationEngine, SimulationRequest,
-    SimulationResult, Unit, VERSION, Waveform,
+    Analysis, AnalysisKind, Circuit, Component, Diagnostic, DiagnosticLevel, DigitalTransition,
+    DigitalWaveform, EngineCapabilities, EngineError, EngineId, ExecutionControl, LogicValue,
+    ParameterValue, PinDirection, Probe, Quantity, SignalDomain, SignalId, SimulationEngine,
+    SimulationRequest, SimulationResult, Unit, VERSION, Waveform,
 };
 
 pub const DIGITAL_ENGINE_ID: &str = "digital";
 pub const MAX_DIGITAL_EVENTS: usize = 1_000_000;
+pub const MAX_DIGITAL_BUS_WIDTH: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LogicVector(pub Vec<LogicValue>);
+
+impl LogicVector {
+    pub fn new(values: Vec<LogicValue>) -> Self {
+        Self(values)
+    }
+
+    pub fn width(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn from_u64(width: usize, value: u64) -> Result<Self, EngineError> {
+        validate_width(width)?;
+        Ok(Self(
+            (0..width)
+                .map(|bit| {
+                    if (value >> bit) & 1 == 1 {
+                        LogicValue::One
+                    } else {
+                        LogicValue::Zero
+                    }
+                })
+                .collect(),
+        ))
+    }
+
+    pub fn to_u64(&self) -> Option<u64> {
+        if self.0.len() > 64 || self.0.iter().any(|value| !value.is_known()) {
+            return None;
+        }
+        let mut result = 0_u64;
+        for (bit, value) in self.0.iter().enumerate() {
+            if *value == LogicValue::One {
+                result |= 1_u64 << bit;
+            }
+        }
+        Some(result)
+    }
+
+    pub fn values(&self) -> &[LogicValue] {
+        &self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GateKind {
@@ -26,7 +75,13 @@ enum GateKind {
     Xnor,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EdgeKind {
+    Rising,
+    Falling,
+}
+
+#[derive(Clone, Debug)]
 enum DigitalPrimitive {
     Constant(LogicValue),
     Clock {
@@ -35,38 +90,299 @@ enum DigitalPrimitive {
         initial: LogicValue,
     },
     Gate(GateKind),
+    TriState,
+    Mux2,
+    Demux2,
+    Decoder2To4,
+    DLatch,
+    SRLatch,
+    DFlipFlop {
+        edge: EdgeKind,
+    },
+    JKFlipFlop {
+        edge: EdgeKind,
+    },
+    TFlipFlop {
+        edge: EdgeKind,
+    },
+    SRFlipFlop {
+        edge: EdgeKind,
+    },
+    Register {
+        width: usize,
+        edge: EdgeKind,
+    },
+    Counter {
+        width: usize,
+        edge: EdgeKind,
+    },
     Sink,
 }
 
 #[derive(Clone, Debug)]
 struct CompiledDigitalComponent {
     primitive: DigitalPrimitive,
-    input_nets: Vec<String>,
-    output_net: Option<String>,
+    input_nets: BTreeMap<String, String>,
+    output_nets: Vec<(String, String)>,
     delay: f64,
+    initial_scalar: LogicValue,
+    initial_vector: Vec<LogicValue>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeState {
+    q: LogicValue,
+    bits: Vec<LogicValue>,
+    previous_clock: LogicValue,
+}
+
+impl RuntimeState {
+    fn for_component(component: &CompiledDigitalComponent) -> Self {
+        Self {
+            q: component.initial_scalar,
+            bits: component.initial_vector.clone(),
+            previous_clock: LogicValue::X,
+        }
+    }
 }
 
 impl CompiledDigitalComponent {
-    fn evaluate(&self, net_values: &BTreeMap<String, LogicValue>) -> Option<LogicValue> {
-        let DigitalPrimitive::Gate(kind) = self.primitive else {
-            return None;
+    fn input(&self, pin: &str, net_values: &BTreeMap<String, LogicValue>) -> LogicValue {
+        self.input_nets
+            .get(pin)
+            .and_then(|net| net_values.get(net))
+            .copied()
+            .unwrap_or(LogicValue::Zero)
+    }
+
+    fn evaluate(
+        &self,
+        net_values: &BTreeMap<String, LogicValue>,
+        state: &mut RuntimeState,
+    ) -> Option<Vec<LogicValue>> {
+        let output = match self.primitive {
+            DigitalPrimitive::Gate(kind) => {
+                let value = match kind {
+                    GateKind::Buffer => self.input("in", net_values).logic_buffer(),
+                    GateKind::Not => self.input("in", net_values).logic_not(),
+                    GateKind::And => self
+                        .input("a", net_values)
+                        .logic_and(self.input("b", net_values)),
+                    GateKind::Or => self
+                        .input("a", net_values)
+                        .logic_or(self.input("b", net_values)),
+                    GateKind::Xor => self
+                        .input("a", net_values)
+                        .logic_xor(self.input("b", net_values)),
+                    GateKind::Nand => self
+                        .input("a", net_values)
+                        .logic_and(self.input("b", net_values))
+                        .logic_not(),
+                    GateKind::Nor => self
+                        .input("a", net_values)
+                        .logic_or(self.input("b", net_values))
+                        .logic_not(),
+                    GateKind::Xnor => self
+                        .input("a", net_values)
+                        .logic_xor(self.input("b", net_values))
+                        .logic_not(),
+                };
+                vec![value]
+            }
+            DigitalPrimitive::TriState => {
+                let input = self.input("in", net_values);
+                let enable = self.input("enable", net_values).logic_buffer();
+                vec![match enable {
+                    LogicValue::Zero => LogicValue::Z,
+                    LogicValue::One => input.logic_buffer(),
+                    LogicValue::X | LogicValue::Z => LogicValue::X,
+                }]
+            }
+            DigitalPrimitive::Mux2 => {
+                let select = self.input("sel", net_values).logic_buffer();
+                vec![match select {
+                    LogicValue::Zero => self.input("a", net_values).logic_buffer(),
+                    LogicValue::One => self.input("b", net_values).logic_buffer(),
+                    LogicValue::X | LogicValue::Z => {
+                        let a = self.input("a", net_values).logic_buffer();
+                        let b = self.input("b", net_values).logic_buffer();
+                        if a == b { a } else { LogicValue::X }
+                    }
+                }]
+            }
+            DigitalPrimitive::Demux2 => {
+                let input = self.input("in", net_values).logic_buffer();
+                let select = self.input("sel", net_values).logic_buffer();
+                match select {
+                    LogicValue::Zero => vec![input, LogicValue::Zero],
+                    LogicValue::One => vec![LogicValue::Zero, input],
+                    LogicValue::X | LogicValue::Z => vec![LogicValue::X, LogicValue::X],
+                }
+            }
+            DigitalPrimitive::Decoder2To4 => {
+                let enable = self.input("enable", net_values).logic_buffer();
+                if enable == LogicValue::Zero {
+                    vec![LogicValue::Zero; 4]
+                } else if enable != LogicValue::One {
+                    vec![LogicValue::X; 4]
+                } else {
+                    let a = self.input("a", net_values).logic_buffer();
+                    let b = self.input("b", net_values).logic_buffer();
+                    if !a.is_known() || !b.is_known() {
+                        vec![LogicValue::X; 4]
+                    } else {
+                        let a_bit = if a == LogicValue::One { 1_usize } else { 0 };
+                        let b_bit = if b == LogicValue::One { 1_usize } else { 0 };
+                        let index = a_bit | (b_bit << 1);
+                        (0..4)
+                            .map(|position| {
+                                if position == index {
+                                    LogicValue::One
+                                } else {
+                                    LogicValue::Zero
+                                }
+                            })
+                            .collect()
+                    }
+                }
+            }
+            DigitalPrimitive::DLatch => {
+                if let Some(async_value) = async_set_reset(self, net_values) {
+                    state.q = async_value;
+                } else {
+                    match self.input("enable", net_values).logic_buffer() {
+                        LogicValue::One => state.q = self.input("d", net_values).logic_buffer(),
+                        LogicValue::Zero => {}
+                        LogicValue::X | LogicValue::Z => state.q = LogicValue::X,
+                    }
+                }
+                q_outputs(state.q, self.output_nets.len())
+            }
+            DigitalPrimitive::SRLatch => {
+                if let Some(async_value) = async_set_reset(self, net_values) {
+                    state.q = async_value;
+                } else {
+                    state.q = sr_next(
+                        state.q,
+                        self.input("s", net_values),
+                        self.input("r", net_values),
+                    );
+                }
+                q_outputs(state.q, self.output_nets.len())
+            }
+            DigitalPrimitive::DFlipFlop { edge } => {
+                let clock = self.input("clk", net_values).logic_buffer();
+                if let Some(async_value) = async_set_reset(self, net_values) {
+                    state.q = async_value;
+                } else if is_edge(state.previous_clock, clock, edge) {
+                    state.q = self.input("d", net_values).logic_buffer();
+                } else if clock == LogicValue::X {
+                    state.q = state.q.logic_buffer();
+                }
+                state.previous_clock = clock;
+                q_outputs(state.q, self.output_nets.len())
+            }
+            DigitalPrimitive::JKFlipFlop { edge } => {
+                let clock = self.input("clk", net_values).logic_buffer();
+                if let Some(async_value) = async_set_reset(self, net_values) {
+                    state.q = async_value;
+                } else if is_edge(state.previous_clock, clock, edge) {
+                    let j = self.input("j", net_values).logic_buffer();
+                    let k = self.input("k", net_values).logic_buffer();
+                    state.q = match (j, k) {
+                        (LogicValue::Zero, LogicValue::Zero) => state.q,
+                        (LogicValue::Zero, LogicValue::One) => LogicValue::Zero,
+                        (LogicValue::One, LogicValue::Zero) => LogicValue::One,
+                        (LogicValue::One, LogicValue::One) => toggle(state.q),
+                        _ => LogicValue::X,
+                    };
+                }
+                state.previous_clock = clock;
+                q_outputs(state.q, self.output_nets.len())
+            }
+            DigitalPrimitive::TFlipFlop { edge } => {
+                let clock = self.input("clk", net_values).logic_buffer();
+                if let Some(async_value) = async_set_reset(self, net_values) {
+                    state.q = async_value;
+                } else if is_edge(state.previous_clock, clock, edge) {
+                    state.q = match self.input("t", net_values).logic_buffer() {
+                        LogicValue::Zero => state.q,
+                        LogicValue::One => toggle(state.q),
+                        LogicValue::X | LogicValue::Z => LogicValue::X,
+                    };
+                }
+                state.previous_clock = clock;
+                q_outputs(state.q, self.output_nets.len())
+            }
+            DigitalPrimitive::SRFlipFlop { edge } => {
+                let clock = self.input("clk", net_values).logic_buffer();
+                if let Some(async_value) = async_set_reset(self, net_values) {
+                    state.q = async_value;
+                } else if is_edge(state.previous_clock, clock, edge) {
+                    state.q = sr_next(
+                        state.q,
+                        self.input("s", net_values),
+                        self.input("r", net_values),
+                    );
+                }
+                state.previous_clock = clock;
+                q_outputs(state.q, self.output_nets.len())
+            }
+            DigitalPrimitive::Register { width, edge } => {
+                let clock = self.input("clk", net_values).logic_buffer();
+                if self.input_nets.contains_key("reset")
+                    && self.input("reset", net_values) == LogicValue::One
+                {
+                    state.bits = vec![LogicValue::Zero; width];
+                } else if is_edge(state.previous_clock, clock, edge) {
+                    let enable = if self.input_nets.contains_key("enable") {
+                        self.input("enable", net_values).logic_buffer()
+                    } else {
+                        LogicValue::One
+                    };
+                    match enable {
+                        LogicValue::Zero => {}
+                        LogicValue::One => {
+                            state.bits = (0..width)
+                                .map(|bit| {
+                                    self.input(&format!("d{bit}"), net_values).logic_buffer()
+                                })
+                                .collect();
+                        }
+                        LogicValue::X | LogicValue::Z => {
+                            state.bits = vec![LogicValue::X; width];
+                        }
+                    }
+                }
+                state.previous_clock = clock;
+                state.bits.clone()
+            }
+            DigitalPrimitive::Counter { width, edge } => {
+                let clock = self.input("clk", net_values).logic_buffer();
+                if self.input_nets.contains_key("reset")
+                    && self.input("reset", net_values) == LogicValue::One
+                {
+                    state.bits = vec![LogicValue::Zero; width];
+                } else if is_edge(state.previous_clock, clock, edge) {
+                    let enable = if self.input_nets.contains_key("enable") {
+                        self.input("enable", net_values).logic_buffer()
+                    } else {
+                        LogicValue::One
+                    };
+                    state.bits = match enable {
+                        LogicValue::Zero => state.bits.clone(),
+                        LogicValue::One => increment_bits(&state.bits),
+                        LogicValue::X | LogicValue::Z => vec![LogicValue::X; width],
+                    };
+                }
+                state.previous_clock = clock;
+                state.bits.clone()
+            }
+            DigitalPrimitive::Constant(_)
+            | DigitalPrimitive::Clock { .. }
+            | DigitalPrimitive::Sink => return None,
         };
-        let inputs = self
-            .input_nets
-            .iter()
-            .map(|net| net_values.get(net).copied().unwrap_or(LogicValue::X))
-            .collect::<Vec<_>>();
-        let value = match kind {
-            GateKind::Buffer => inputs[0].logic_buffer(),
-            GateKind::Not => inputs[0].logic_not(),
-            GateKind::And => inputs[0].logic_and(inputs[1]),
-            GateKind::Or => inputs[0].logic_or(inputs[1]),
-            GateKind::Xor => inputs[0].logic_xor(inputs[1]),
-            GateKind::Nand => inputs[0].logic_and(inputs[1]).logic_not(),
-            GateKind::Nor => inputs[0].logic_or(inputs[1]).logic_not(),
-            GateKind::Xnor => inputs[0].logic_xor(inputs[1]).logic_not(),
-        };
-        Some(value)
+        Some(output)
     }
 }
 
@@ -76,10 +392,17 @@ struct CompiledProbe {
     net: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DriverKey {
+    component: usize,
+    output: usize,
+}
+
 #[derive(Clone, Debug)]
 struct DigitalProgram {
     components: Vec<CompiledDigitalComponent>,
     dependents: BTreeMap<String, Vec<usize>>,
+    net_drivers: BTreeMap<String, Vec<DriverKey>>,
     nets: Vec<String>,
     probes: Vec<CompiledProbe>,
 }
@@ -92,8 +415,7 @@ impl DigitalProgram {
                 "the built-in digital engine only supports digital_transient analysis",
             ));
         };
-        let stop = *stop;
-        if !stop.is_finite() || stop <= 0.0 {
+        if !stop.is_finite() || *stop <= 0.0 {
             return Err(EngineError::new(
                 "digital_invalid_analysis",
                 "digital transient stop time must be finite and greater than zero",
@@ -103,29 +425,24 @@ impl DigitalProgram {
         let endpoint_net = endpoint_net_map(&request.circuit)?;
         let mut components = Vec::with_capacity(request.circuit.components.len());
         let mut dependents: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut net_drivers: BTreeMap<String, Vec<DriverKey>> = BTreeMap::new();
 
         for component in &request.circuit.components {
             let compiled = compile_component(component, &endpoint_net)?;
             let component_index = components.len();
-            for net in &compiled.input_nets {
+            for net in compiled.input_nets.values() {
                 dependents
                     .entry(net.clone())
                     .or_default()
                     .push(component_index);
             }
-            components.push(compiled);
-        }
-
-        let mut driven_nets = BTreeSet::new();
-        for component in &components {
-            if let Some(net) = component.output_net.as_ref() {
-                if !driven_nets.insert(net.clone()) {
-                    return Err(EngineError::new(
-                        "digital_multiple_drivers",
-                        format!("digital net `{net}` has more than one driver"),
-                    ));
-                }
+            for (output_index, (_, net)) in compiled.output_nets.iter().enumerate() {
+                net_drivers.entry(net.clone()).or_default().push(DriverKey {
+                    component: component_index,
+                    output: output_index,
+                });
             }
+            components.push(compiled);
         }
 
         let nets = request
@@ -145,6 +462,7 @@ impl DigitalProgram {
         Ok(Self {
             components,
             dependents,
+            net_drivers,
             nets,
             probes,
         })
@@ -155,7 +473,7 @@ impl DigitalProgram {
 struct ScheduledEvent {
     time: f64,
     sequence: u64,
-    net: String,
+    driver: DriverKey,
     value: LogicValue,
 }
 
@@ -228,24 +546,32 @@ impl DigitalEngine {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let mut driver_values = BTreeMap::<DriverKey, LogicValue>::new();
+        for drivers in program.net_drivers.values() {
+            for driver in drivers {
+                driver_values.insert(*driver, LogicValue::Z);
+            }
+        }
+        let mut runtime_states = program
+            .components
+            .iter()
+            .map(RuntimeState::for_component)
+            .collect::<Vec<_>>();
 
         let mut queue = BinaryHeap::new();
         let mut sequence = 0_u64;
         let mut scheduled_events = 0_usize;
 
-        for component in &program.components {
+        for (component_index, component) in program.components.iter().enumerate() {
             match component.primitive {
                 DigitalPrimitive::Constant(value) => {
-                    let net = component
-                        .output_net
-                        .as_ref()
-                        .expect("source output is compiled");
-                    schedule_event(
+                    schedule_output(
                         &mut queue,
                         &mut sequence,
                         &mut scheduled_events,
                         0.0,
-                        net,
+                        component_index,
+                        0,
                         value,
                     )?;
                 }
@@ -254,15 +580,11 @@ impl DigitalEngine {
                     duty_cycle,
                     initial,
                 } => {
-                    let net = component
-                        .output_net
-                        .as_ref()
-                        .expect("clock output is compiled");
                     schedule_clock(
                         &mut queue,
                         &mut sequence,
                         &mut scheduled_events,
-                        net,
+                        component_index,
                         stop,
                         period,
                         duty_cycle,
@@ -271,52 +593,117 @@ impl DigitalEngine {
                         started,
                     )?;
                 }
-                DigitalPrimitive::Gate(_) | DigitalPrimitive::Sink => {}
+                DigitalPrimitive::DLatch
+                | DigitalPrimitive::SRLatch
+                | DigitalPrimitive::DFlipFlop { .. }
+                | DigitalPrimitive::JKFlipFlop { .. }
+                | DigitalPrimitive::TFlipFlop { .. }
+                | DigitalPrimitive::SRFlipFlop { .. }
+                | DigitalPrimitive::Register { .. }
+                | DigitalPrimitive::Counter { .. } => {
+                    let outputs = initial_outputs(component, &runtime_states[component_index]);
+                    for (output_index, value) in outputs.into_iter().enumerate() {
+                        schedule_output(
+                            &mut queue,
+                            &mut sequence,
+                            &mut scheduled_events,
+                            0.0,
+                            component_index,
+                            output_index,
+                            value,
+                        )?;
+                    }
+                }
+                DigitalPrimitive::Gate(_)
+                | DigitalPrimitive::TriState
+                | DigitalPrimitive::Mux2
+                | DigitalPrimitive::Demux2
+                | DigitalPrimitive::Decoder2To4
+                | DigitalPrimitive::Sink => {}
             }
         }
 
         let mut processed_events = 0_usize;
-        while let Some(event) = queue.pop() {
+        while let Some(first) = queue.pop() {
             check_execution(control, started)?;
-            if event.time > stop {
+            if first.time > stop {
                 break;
             }
-            processed_events += 1;
+            let time = first.time;
+            let mut batch = vec![first];
+            while queue
+                .peek()
+                .is_some_and(|event| event.time.to_bits() == time.to_bits())
+            {
+                batch.push(queue.pop().expect("peeked event exists"));
+            }
+
+            processed_events += batch.len();
             if processed_events > MAX_DIGITAL_EVENTS {
                 return Err(event_limit_error());
             }
 
-            let current = net_values.get(&event.net).copied().unwrap_or(LogicValue::X);
-            if current == event.value {
-                continue;
+            let mut affected_nets = BTreeSet::new();
+            for event in batch {
+                let previous = driver_values
+                    .insert(event.driver, event.value)
+                    .unwrap_or(LogicValue::Z);
+                if previous != event.value {
+                    let net = &program.components[event.driver.component].output_nets
+                        [event.driver.output]
+                        .1;
+                    affected_nets.insert(net.clone());
+                }
             }
-            net_values.insert(event.net.clone(), event.value);
-            push_transition(
-                histories
-                    .get_mut(&event.net)
-                    .expect("compiled digital net owns history"),
-                event.time,
-                event.value,
-            );
-            enforce_transition_budget(&histories, control)?;
 
-            if let Some(dependent_indices) = program.dependents.get(&event.net) {
-                for component_index in dependent_indices {
-                    let component = &program.components[*component_index];
-                    let Some(value) = component.evaluate(&net_values) else {
-                        continue;
-                    };
-                    let Some(output_net) = component.output_net.as_ref() else {
-                        continue;
-                    };
-                    let output_time = event.time + component.delay;
+            let mut affected_components = BTreeSet::new();
+            for net in affected_nets {
+                let resolved = resolve_net(
+                    program
+                        .net_drivers
+                        .get(&net)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    &driver_values,
+                );
+                let current = net_values.get(&net).copied().unwrap_or(LogicValue::X);
+                if resolved == current {
+                    continue;
+                }
+                net_values.insert(net.clone(), resolved);
+                push_transition(
+                    histories
+                        .get_mut(&net)
+                        .expect("compiled digital net owns history"),
+                    time,
+                    resolved,
+                );
+                enforce_transition_budget(&histories, control)?;
+                if let Some(dependents) = program.dependents.get(&net) {
+                    affected_components.extend(dependents.iter().copied());
+                }
+            }
+
+            for component_index in affected_components {
+                let component = &program.components[component_index];
+                let Some(values) =
+                    component.evaluate(&net_values, &mut runtime_states[component_index])
+                else {
+                    continue;
+                };
+                for (output_index, value) in values.into_iter().enumerate() {
+                    if output_index >= component.output_nets.len() {
+                        break;
+                    }
+                    let output_time = time + component.delay;
                     if output_time <= stop {
-                        schedule_event(
+                        schedule_output(
                             &mut queue,
                             &mut sequence,
                             &mut scheduled_events,
                             output_time,
-                            output_net,
+                            component_index,
+                            output_index,
                             value,
                         )?;
                     }
@@ -338,13 +725,26 @@ impl DigitalEngine {
             })
             .collect::<Vec<_>>();
 
+        let mut diagnostics = Vec::<Diagnostic>::new();
+        if program
+            .net_drivers
+            .values()
+            .any(|drivers| drivers.len() > 1)
+        {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Info,
+                code: "digital_multi_driver_resolution".to_owned(),
+                message: "digital nets with multiple drivers were resolved with four-state Z/X contention semantics".to_owned(),
+            });
+        }
+
         Ok(SimulationResult::new(
             self.id(),
             self.version(),
             request.analysis.kind(),
             request.circuit.schema_version,
             waveforms,
-            Vec::<Diagnostic>::new(),
+            diagnostics,
         ))
     }
 }
@@ -426,6 +826,115 @@ impl LogicValue {
     }
 }
 
+fn resolve_net(
+    drivers: &[DriverKey],
+    driver_values: &BTreeMap<DriverKey, LogicValue>,
+) -> LogicValue {
+    if drivers.is_empty() {
+        return LogicValue::X;
+    }
+    let mut resolved = LogicValue::Z;
+    for driver in drivers {
+        let value = driver_values.get(driver).copied().unwrap_or(LogicValue::Z);
+        match value {
+            LogicValue::Z => {}
+            LogicValue::X => return LogicValue::X,
+            LogicValue::Zero | LogicValue::One => {
+                if resolved == LogicValue::Z {
+                    resolved = value;
+                } else if resolved != value {
+                    return LogicValue::X;
+                }
+            }
+        }
+    }
+    resolved
+}
+
+fn async_set_reset(
+    component: &CompiledDigitalComponent,
+    net_values: &BTreeMap<String, LogicValue>,
+) -> Option<LogicValue> {
+    let set = if component.input_nets.contains_key("set") {
+        component.input("set", net_values).logic_buffer()
+    } else {
+        LogicValue::Zero
+    };
+    let reset = if component.input_nets.contains_key("reset") {
+        component.input("reset", net_values).logic_buffer()
+    } else {
+        LogicValue::Zero
+    };
+    match (set, reset) {
+        (LogicValue::Zero, LogicValue::Zero) => None,
+        (LogicValue::One, LogicValue::Zero) => Some(LogicValue::One),
+        (LogicValue::Zero, LogicValue::One) => Some(LogicValue::Zero),
+        (LogicValue::One, LogicValue::One) => Some(LogicValue::X),
+        _ => Some(LogicValue::X),
+    }
+}
+
+fn sr_next(current: LogicValue, set: LogicValue, reset: LogicValue) -> LogicValue {
+    match (set.logic_buffer(), reset.logic_buffer()) {
+        (LogicValue::Zero, LogicValue::Zero) => current,
+        (LogicValue::One, LogicValue::Zero) => LogicValue::One,
+        (LogicValue::Zero, LogicValue::One) => LogicValue::Zero,
+        (LogicValue::One, LogicValue::One) => LogicValue::X,
+        _ => LogicValue::X,
+    }
+}
+
+fn toggle(value: LogicValue) -> LogicValue {
+    match value {
+        LogicValue::Zero => LogicValue::One,
+        LogicValue::One => LogicValue::Zero,
+        LogicValue::X | LogicValue::Z => LogicValue::X,
+    }
+}
+
+fn q_outputs(q: LogicValue, count: usize) -> Vec<LogicValue> {
+    match count {
+        0 => Vec::new(),
+        1 => vec![q],
+        _ => vec![q, q.logic_not()],
+    }
+}
+
+fn is_edge(previous: LogicValue, current: LogicValue, edge: EdgeKind) -> bool {
+    match edge {
+        EdgeKind::Rising => previous == LogicValue::Zero && current == LogicValue::One,
+        EdgeKind::Falling => previous == LogicValue::One && current == LogicValue::Zero,
+    }
+}
+
+fn increment_bits(bits: &[LogicValue]) -> Vec<LogicValue> {
+    let vector = LogicVector::new(bits.to_vec());
+    let Some(value) = vector.to_u64() else {
+        return vec![LogicValue::X; bits.len()];
+    };
+    let mask = if bits.len() == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << bits.len()) - 1
+    };
+    LogicVector::from_u64(bits.len(), value.wrapping_add(1) & mask)
+        .map(|vector| vector.0)
+        .unwrap_or_else(|_| vec![LogicValue::X; bits.len()])
+}
+
+fn initial_outputs(component: &CompiledDigitalComponent, state: &RuntimeState) -> Vec<LogicValue> {
+    match component.primitive {
+        DigitalPrimitive::Register { .. } | DigitalPrimitive::Counter { .. } => state.bits.clone(),
+        DigitalPrimitive::DLatch
+        | DigitalPrimitive::SRLatch
+        | DigitalPrimitive::DFlipFlop { .. }
+        | DigitalPrimitive::JKFlipFlop { .. }
+        | DigitalPrimitive::TFlipFlop { .. }
+        | DigitalPrimitive::SRFlipFlop { .. } => q_outputs(state.q, component.output_nets.len()),
+        _ => Vec::new(),
+    }
+}
+
 fn endpoint_net_map(circuit: &Circuit) -> Result<BTreeMap<(String, String), String>, EngineError> {
     let mut map = BTreeMap::new();
     for net in &circuit.nets {
@@ -455,62 +964,149 @@ fn compile_component(
     endpoint_net: &BTreeMap<(String, String), String>,
 ) -> Result<CompiledDigitalComponent, EngineError> {
     let kind = component.kind.as_str();
-    let (primitive, input_pins, output_pin) = match kind {
-        "logic_input" => (
-            DigitalPrimitive::Constant(required_logic_value(component, "value")?),
-            Vec::new(),
-            Some("out"),
-        ),
-        "digital_clock" => (
+    let mut input_pins = Vec::<String>::new();
+    let mut output_pins = Vec::<String>::new();
+    let primitive = match kind {
+        "logic_input" => {
+            output_pins.push("out".to_owned());
+            DigitalPrimitive::Constant(required_logic_value(component, "value")?)
+        }
+        "digital_clock" => {
+            output_pins.push("out".to_owned());
             DigitalPrimitive::Clock {
                 period: required_positive_seconds(component, "period")?,
                 duty_cycle: duty_cycle(component)?,
                 initial: optional_logic_value(component, "initial")?.unwrap_or(LogicValue::Zero),
-            },
-            Vec::new(),
-            Some("out"),
+            }
+        }
+        "logic_output" => {
+            input_pins.push("in".to_owned());
+            DigitalPrimitive::Sink
+        }
+        "buffer" => gate_primitive(&mut input_pins, &mut output_pins, GateKind::Buffer, &["in"]),
+        "not_gate" => gate_primitive(&mut input_pins, &mut output_pins, GateKind::Not, &["in"]),
+        "and_gate" => gate_primitive(
+            &mut input_pins,
+            &mut output_pins,
+            GateKind::And,
+            &["a", "b"],
         ),
-        "logic_output" => (DigitalPrimitive::Sink, vec!["in"], None),
-        "buffer" => (
-            DigitalPrimitive::Gate(GateKind::Buffer),
-            vec!["in"],
-            Some("out"),
+        "or_gate" => gate_primitive(&mut input_pins, &mut output_pins, GateKind::Or, &["a", "b"]),
+        "xor_gate" => gate_primitive(
+            &mut input_pins,
+            &mut output_pins,
+            GateKind::Xor,
+            &["a", "b"],
         ),
-        "not_gate" => (
-            DigitalPrimitive::Gate(GateKind::Not),
-            vec!["in"],
-            Some("out"),
+        "nand_gate" => gate_primitive(
+            &mut input_pins,
+            &mut output_pins,
+            GateKind::Nand,
+            &["a", "b"],
         ),
-        "and_gate" => (
-            DigitalPrimitive::Gate(GateKind::And),
-            vec!["a", "b"],
-            Some("out"),
+        "nor_gate" => gate_primitive(
+            &mut input_pins,
+            &mut output_pins,
+            GateKind::Nor,
+            &["a", "b"],
         ),
-        "or_gate" => (
-            DigitalPrimitive::Gate(GateKind::Or),
-            vec!["a", "b"],
-            Some("out"),
+        "xnor_gate" => gate_primitive(
+            &mut input_pins,
+            &mut output_pins,
+            GateKind::Xnor,
+            &["a", "b"],
         ),
-        "xor_gate" => (
-            DigitalPrimitive::Gate(GateKind::Xor),
-            vec!["a", "b"],
-            Some("out"),
-        ),
-        "nand_gate" => (
-            DigitalPrimitive::Gate(GateKind::Nand),
-            vec!["a", "b"],
-            Some("out"),
-        ),
-        "nor_gate" => (
-            DigitalPrimitive::Gate(GateKind::Nor),
-            vec!["a", "b"],
-            Some("out"),
-        ),
-        "xnor_gate" => (
-            DigitalPrimitive::Gate(GateKind::Xnor),
-            vec!["a", "b"],
-            Some("out"),
-        ),
+        "tri_state_buffer" => {
+            input_pins.extend(["in", "enable"].into_iter().map(str::to_owned));
+            output_pins.push("out".to_owned());
+            DigitalPrimitive::TriState
+        }
+        "mux2" => {
+            input_pins.extend(["a", "b", "sel"].into_iter().map(str::to_owned));
+            output_pins.push("out".to_owned());
+            DigitalPrimitive::Mux2
+        }
+        "demux2" => {
+            input_pins.extend(["in", "sel"].into_iter().map(str::to_owned));
+            output_pins.extend(["a", "b"].into_iter().map(str::to_owned));
+            DigitalPrimitive::Demux2
+        }
+        "decoder2_to_4" => {
+            input_pins.extend(["a", "b", "enable"].into_iter().map(str::to_owned));
+            output_pins.extend((0..4).map(|index| format!("y{index}")));
+            DigitalPrimitive::Decoder2To4
+        }
+        "d_latch" => {
+            input_pins.extend(["d", "enable"].into_iter().map(str::to_owned));
+            append_optional_inputs(component, &mut input_pins, &["set", "reset"]);
+            output_pins.push("q".to_owned());
+            append_optional_outputs(component, &mut output_pins, &["nq"]);
+            DigitalPrimitive::DLatch
+        }
+        "sr_latch" => {
+            input_pins.extend(["s", "r"].into_iter().map(str::to_owned));
+            append_optional_inputs(component, &mut input_pins, &["set", "reset"]);
+            output_pins.push("q".to_owned());
+            append_optional_outputs(component, &mut output_pins, &["nq"]);
+            DigitalPrimitive::SRLatch
+        }
+        "d_flip_flop" => {
+            input_pins.extend(["d", "clk"].into_iter().map(str::to_owned));
+            append_optional_inputs(component, &mut input_pins, &["set", "reset"]);
+            output_pins.push("q".to_owned());
+            append_optional_outputs(component, &mut output_pins, &["nq"]);
+            DigitalPrimitive::DFlipFlop {
+                edge: edge_kind(component)?,
+            }
+        }
+        "jk_flip_flop" => {
+            input_pins.extend(["j", "k", "clk"].into_iter().map(str::to_owned));
+            append_optional_inputs(component, &mut input_pins, &["set", "reset"]);
+            output_pins.push("q".to_owned());
+            append_optional_outputs(component, &mut output_pins, &["nq"]);
+            DigitalPrimitive::JKFlipFlop {
+                edge: edge_kind(component)?,
+            }
+        }
+        "t_flip_flop" => {
+            input_pins.extend(["t", "clk"].into_iter().map(str::to_owned));
+            append_optional_inputs(component, &mut input_pins, &["set", "reset"]);
+            output_pins.push("q".to_owned());
+            append_optional_outputs(component, &mut output_pins, &["nq"]);
+            DigitalPrimitive::TFlipFlop {
+                edge: edge_kind(component)?,
+            }
+        }
+        "sr_flip_flop" => {
+            input_pins.extend(["s", "r", "clk"].into_iter().map(str::to_owned));
+            append_optional_inputs(component, &mut input_pins, &["set", "reset"]);
+            output_pins.push("q".to_owned());
+            append_optional_outputs(component, &mut output_pins, &["nq"]);
+            DigitalPrimitive::SRFlipFlop {
+                edge: edge_kind(component)?,
+            }
+        }
+        "register" => {
+            let width = component_width(component)?;
+            input_pins.extend((0..width).map(|bit| format!("d{bit}")));
+            input_pins.push("clk".to_owned());
+            append_optional_inputs(component, &mut input_pins, &["enable", "reset"]);
+            output_pins.extend((0..width).map(|bit| format!("q{bit}")));
+            DigitalPrimitive::Register {
+                width,
+                edge: edge_kind(component)?,
+            }
+        }
+        "counter" => {
+            let width = component_width(component)?;
+            input_pins.push("clk".to_owned());
+            append_optional_inputs(component, &mut input_pins, &["enable", "reset"]);
+            output_pins.extend((0..width).map(|bit| format!("q{bit}")));
+            DigitalPrimitive::Counter {
+                width,
+                edge: edge_kind(component)?,
+            }
+        }
         _ => {
             return Err(EngineError::new(
                 "digital_unsupported_component",
@@ -522,33 +1118,142 @@ fn compile_component(
         }
     };
 
-    let mut input_nets = Vec::with_capacity(input_pins.len());
+    let mut input_nets = BTreeMap::new();
     for pin in input_pins {
-        require_pin(component, pin, PinDirection::Input)?;
-        input_nets.push(require_connected_net(component, pin, endpoint_net)?);
+        require_pin(component, &pin, PinDirection::Input)?;
+        input_nets.insert(
+            pin.clone(),
+            require_connected_net(component, &pin, endpoint_net)?,
+        );
     }
-    let output_net = if let Some(pin) = output_pin {
-        require_pin(component, pin, PinDirection::Output)?;
-        Some(require_connected_net(component, pin, endpoint_net)?)
-    } else {
-        None
-    };
+    let mut output_nets = Vec::new();
+    for pin in output_pins {
+        require_pin(component, &pin, PinDirection::Output)?;
+        output_nets.push((
+            pin.clone(),
+            require_connected_net(component, &pin, endpoint_net)?,
+        ));
+    }
 
     let delay = match primitive {
-        DigitalPrimitive::Gate(_) => {
-            optional_non_negative_seconds(component, "delay")?.unwrap_or(0.0)
-        }
         DigitalPrimitive::Constant(_) | DigitalPrimitive::Clock { .. } | DigitalPrimitive::Sink => {
             0.0
         }
+        _ => optional_non_negative_seconds(component, "delay")?.unwrap_or(0.0),
+    };
+
+    let initial_scalar = match primitive {
+        DigitalPrimitive::DLatch
+        | DigitalPrimitive::SRLatch
+        | DigitalPrimitive::DFlipFlop { .. }
+        | DigitalPrimitive::JKFlipFlop { .. }
+        | DigitalPrimitive::TFlipFlop { .. }
+        | DigitalPrimitive::SRFlipFlop { .. } => {
+            optional_logic_value(component, "initial")?.unwrap_or(LogicValue::X)
+        }
+        _ => LogicValue::X,
+    };
+    let initial_vector = match primitive {
+        DigitalPrimitive::Register { width, .. } | DigitalPrimitive::Counter { width, .. } => {
+            initial_vector(component, width)?
+        }
+        _ => Vec::new(),
     };
 
     Ok(CompiledDigitalComponent {
         primitive,
         input_nets,
-        output_net,
+        output_nets,
         delay,
+        initial_scalar,
+        initial_vector,
     })
+}
+
+fn gate_primitive(
+    input_pins: &mut Vec<String>,
+    output_pins: &mut Vec<String>,
+    kind: GateKind,
+    inputs: &[&str],
+) -> DigitalPrimitive {
+    input_pins.extend(inputs.iter().map(|pin| (*pin).to_owned()));
+    output_pins.push("out".to_owned());
+    DigitalPrimitive::Gate(kind)
+}
+
+fn append_optional_inputs(component: &Component, pins: &mut Vec<String>, names: &[&str]) {
+    for name in names {
+        if component.pins.iter().any(|pin| pin.id.as_str() == *name) {
+            pins.push((*name).to_owned());
+        }
+    }
+}
+
+fn append_optional_outputs(component: &Component, pins: &mut Vec<String>, names: &[&str]) {
+    for name in names {
+        if component.pins.iter().any(|pin| pin.id.as_str() == *name) {
+            pins.push((*name).to_owned());
+        }
+    }
+}
+
+fn component_width(component: &Component) -> Result<usize, EngineError> {
+    let width = match component.parameters.get("width") {
+        Some(ParameterValue::Integer(value)) if *value > 0 => *value as usize,
+        Some(ParameterValue::Number(value)) if value.is_finite() && *value > 0.0 => *value as usize,
+        Some(_) => {
+            return Err(component_error(
+                component,
+                "parameter `width` must be a positive integer",
+            ));
+        }
+        None => 4,
+    };
+    validate_width(width)?;
+    Ok(width)
+}
+
+fn validate_width(width: usize) -> Result<(), EngineError> {
+    if width == 0 || width > MAX_DIGITAL_BUS_WIDTH {
+        return Err(EngineError::new(
+            "digital_invalid_bus_width",
+            format!("digital bus width must be in 1..={MAX_DIGITAL_BUS_WIDTH}, got {width}"),
+        ));
+    }
+    Ok(())
+}
+
+fn initial_vector(component: &Component, width: usize) -> Result<Vec<LogicValue>, EngineError> {
+    match component.parameters.get("initial") {
+        None => Ok(vec![LogicValue::Zero; width]),
+        Some(ParameterValue::Integer(value)) if *value >= 0 => {
+            Ok(LogicVector::from_u64(width, *value as u64)?.0)
+        }
+        Some(ParameterValue::Number(value))
+            if value.is_finite() && *value >= 0.0 && value.fract() == 0.0 =>
+        {
+            Ok(LogicVector::from_u64(width, *value as u64)?.0)
+        }
+        Some(_) => Err(component_error(
+            component,
+            "vector parameter `initial` must be a non-negative integer",
+        )),
+    }
+}
+
+fn edge_kind(component: &Component) -> Result<EdgeKind, EngineError> {
+    match component.parameters.get("edge") {
+        None => Ok(EdgeKind::Rising),
+        Some(ParameterValue::Text(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "rising" | "positive" | "pos" => Ok(EdgeKind::Rising),
+            "falling" | "negative" | "neg" => Ok(EdgeKind::Falling),
+            _ => Err(component_error(
+                component,
+                "parameter `edge` must be `rising` or `falling`",
+            )),
+        },
+        Some(_) => Err(component_error(component, "parameter `edge` must be text")),
+    }
 }
 
 fn require_pin(
@@ -776,7 +1481,7 @@ fn schedule_clock(
     queue: &mut BinaryHeap<ScheduledEvent>,
     sequence: &mut u64,
     scheduled_events: &mut usize,
-    net: &str,
+    component_index: usize,
     stop: f64,
     period: f64,
     duty_cycle: f64,
@@ -790,7 +1495,15 @@ fn schedule_clock(
             "digital clock initial value must be zero or one",
         ));
     }
-    schedule_event(queue, sequence, scheduled_events, 0.0, net, initial)?;
+    schedule_output(
+        queue,
+        sequence,
+        scheduled_events,
+        0.0,
+        component_index,
+        0,
+        initial,
+    )?;
 
     let high_duration = period * duty_cycle;
     let low_duration = period * (1.0 - duty_cycle);
@@ -811,17 +1524,27 @@ fn schedule_clock(
         } else {
             LogicValue::One
         };
-        schedule_event(queue, sequence, scheduled_events, time, net, value)?;
+        schedule_output(
+            queue,
+            sequence,
+            scheduled_events,
+            time,
+            component_index,
+            0,
+            value,
+        )?;
     }
     Ok(())
 }
 
-fn schedule_event(
+#[allow(clippy::too_many_arguments)]
+fn schedule_output(
     queue: &mut BinaryHeap<ScheduledEvent>,
     sequence: &mut u64,
     scheduled_events: &mut usize,
     time: f64,
-    net: &str,
+    component: usize,
+    output: usize,
     value: LogicValue,
 ) -> Result<(), EngineError> {
     if !time.is_finite() || time < 0.0 {
@@ -837,7 +1560,7 @@ fn schedule_event(
     queue.push(ScheduledEvent {
         time,
         sequence: *sequence,
-        net: net.to_owned(),
+        driver: DriverKey { component, output },
         value,
     });
     *sequence = (*sequence).wrapping_add(1);

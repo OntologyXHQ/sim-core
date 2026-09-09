@@ -325,7 +325,6 @@ fn compile_request(request: &SimulationRequest) -> Result<CompiledXSpiceRequest,
     let mut sources = Vec::new();
     let mut gate_lines = Vec::new();
     let mut model_lines = Vec::new();
-    let mut driven_nodes = BTreeSet::new();
     let mut delay_floor_applied = false;
 
     for (index, component) in request.circuit.components.iter().enumerate() {
@@ -333,7 +332,6 @@ fn compile_request(request: &SimulationRequest) -> Result<CompiledXSpiceRequest,
             "logic_input" => {
                 require_pin(component, "out", PinDirection::Output)?;
                 let node = connected_node(component, "out", &endpoint_net, &net_nodes)?;
-                register_driver(component, &node, &mut driven_nodes)?;
                 sources.push(SourceSpec {
                     node,
                     events: vec![(0.0, required_logic_value(component, "value")?)],
@@ -342,7 +340,6 @@ fn compile_request(request: &SimulationRequest) -> Result<CompiledXSpiceRequest,
             "digital_clock" => {
                 require_pin(component, "out", PinDirection::Output)?;
                 let node = connected_node(component, "out", &endpoint_net, &net_nodes)?;
-                register_driver(component, &node, &mut driven_nodes)?;
                 let period = required_positive_seconds(component, "period")?;
                 let duty = duty_cycle(component)?;
                 let initial =
@@ -368,7 +365,6 @@ fn compile_request(request: &SimulationRequest) -> Result<CompiledXSpiceRequest,
                     .collect::<Result<Vec<_>, _>>()?;
                 require_pin(component, output_pin, PinDirection::Output)?;
                 let output_node = connected_node(component, output_pin, &endpoint_net, &net_nodes)?;
-                register_driver(component, &output_node, &mut driven_nodes)?;
                 let model_name = format!("xg{index}");
                 let instance_name = format!("ag{index}");
                 let input_expr = if input_nodes.len() == 1 {
@@ -388,6 +384,36 @@ fn compile_request(request: &SimulationRequest) -> Result<CompiledXSpiceRequest,
                     spice_number(delay),
                     spice_number(delay)
                 ));
+            }
+            "tri_state_buffer" => {
+                for pin in ["in", "enable"] {
+                    require_pin(component, pin, PinDirection::Input)?;
+                }
+                require_pin(component, "out", PinDirection::Output)?;
+                let input = connected_node(component, "in", &endpoint_net, &net_nodes)?;
+                let enable = connected_node(component, "enable", &endpoint_net, &net_nodes)?;
+                let output = connected_node(component, "out", &endpoint_net, &net_nodes)?;
+                let model_name = format!("xt{index}");
+                gate_lines.push(format!("at{index} {input} {enable} {output} {model_name}"));
+                let requested_delay =
+                    optional_non_negative_seconds(component, "delay")?.unwrap_or(0.0);
+                let delay = requested_delay.max(XSPICE_MIN_DELAY_SECONDS);
+                delay_floor_applied |= requested_delay < XSPICE_MIN_DELAY_SECONDS;
+                model_lines.push(format!(
+                    ".model {model_name} d_tristate(delay={})",
+                    spice_number(delay)
+                ));
+            }
+            "d_flip_flop" | "jk_flip_flop" | "t_flip_flop" | "sr_flip_flop" | "d_latch" => {
+                compile_sequential_xspice(
+                    component,
+                    index,
+                    &endpoint_net,
+                    &net_nodes,
+                    &mut gate_lines,
+                    &mut model_lines,
+                    &mut delay_floor_applied,
+                )?;
             }
             other => {
                 return Err(EngineError::new(
@@ -497,19 +523,139 @@ fn gate_contract(
     }
 }
 
-fn register_driver(
+#[allow(clippy::too_many_arguments)]
+fn compile_sequential_xspice(
     component: &Component,
-    node: &str,
-    driven_nodes: &mut BTreeSet<String>,
+    index: usize,
+    endpoint_net: &BTreeMap<(String, String), String>,
+    net_nodes: &BTreeMap<String, String>,
+    instance_lines: &mut Vec<String>,
+    model_lines: &mut Vec<String>,
+    delay_floor_applied: &mut bool,
 ) -> Result<(), EngineError> {
-    if !driven_nodes.insert(node.to_owned()) {
-        return Err(EngineError::new(
-            "xspice_multiple_drivers",
-            format!(
-                "component `{}` drives digital node `{node}` that already has a driver",
-                component.id.as_str()
-            ),
-        ));
+    if let Some(ParameterValue::Text(edge)) = component.parameters.get("edge") {
+        let normalized = edge.trim().to_ascii_lowercase();
+        if !matches!(normalized.as_str(), "rising" | "positive" | "pos") {
+            return Err(EngineError::new(
+                "xspice_unsupported_clock_edge",
+                format!(
+                    "component `{}` requests `{edge}` clocking but the canonical XSPICE sequential models are rising-edge triggered",
+                    component.id.as_str()
+                ),
+            ));
+        }
+    }
+
+    let requested_delay = optional_non_negative_seconds(component, "delay")?.unwrap_or(0.0);
+    let delay = requested_delay.max(XSPICE_MIN_DELAY_SECONDS);
+    *delay_floor_applied |= requested_delay < XSPICE_MIN_DELAY_SECONDS;
+    let model_name = format!("xs{index}");
+
+    let require_node = |pin: &str, direction: PinDirection| -> Result<String, EngineError> {
+        require_pin(component, pin, direction)?;
+        connected_node(component, pin, endpoint_net, net_nodes)
+    };
+    let require_controls = || -> Result<(String, String, String), EngineError> {
+        let set = require_node("set", PinDirection::Input)?;
+        let reset = require_node("reset", PinDirection::Input)?;
+        let nq = require_node("nq", PinDirection::Output)?;
+        Ok((set, reset, nq))
+    };
+
+    let ic = match optional_logic_value(component, "initial")?.unwrap_or(LogicValue::X) {
+        LogicValue::Zero => 0,
+        LogicValue::One => 1,
+        LogicValue::X | LogicValue::Z => 2,
+    };
+
+    match component.kind.as_str() {
+        "d_flip_flop" => {
+            let d = require_node("d", PinDirection::Input)?;
+            let clk = require_node("clk", PinDirection::Input)?;
+            let q = require_node("q", PinDirection::Output)?;
+            let (set, reset, nq) = require_controls()?;
+            instance_lines.push(format!(
+                "as{index} {d} {clk} {set} {reset} {q} {nq} {model_name}"
+            ));
+            model_lines.push(format!(
+                ".model {model_name} d_dff(clk_delay={} set_delay={} reset_delay={} ic={ic} rise_delay={} fall_delay={})",
+                spice_number(delay),
+                spice_number(delay),
+                spice_number(delay),
+                spice_number(XSPICE_MIN_DELAY_SECONDS),
+                spice_number(XSPICE_MIN_DELAY_SECONDS)
+            ));
+        }
+        "jk_flip_flop" | "t_flip_flop" => {
+            let (j, k) = if component.kind.as_str() == "t_flip_flop" {
+                let t = require_node("t", PinDirection::Input)?;
+                (t.clone(), t)
+            } else {
+                (
+                    require_node("j", PinDirection::Input)?,
+                    require_node("k", PinDirection::Input)?,
+                )
+            };
+            let clk = require_node("clk", PinDirection::Input)?;
+            let q = require_node("q", PinDirection::Output)?;
+            let (set, reset, nq) = require_controls()?;
+            instance_lines.push(format!(
+                "as{index} {j} {k} {clk} {set} {reset} {q} {nq} {model_name}"
+            ));
+            model_lines.push(format!(
+                ".model {model_name} d_jkff(clk_delay={} set_delay={} reset_delay={} ic={ic} rise_delay={} fall_delay={})",
+                spice_number(delay),
+                spice_number(delay),
+                spice_number(delay),
+                spice_number(XSPICE_MIN_DELAY_SECONDS),
+                spice_number(XSPICE_MIN_DELAY_SECONDS)
+            ));
+        }
+        "sr_flip_flop" => {
+            let s = require_node("s", PinDirection::Input)?;
+            let r = require_node("r", PinDirection::Input)?;
+            let clk = require_node("clk", PinDirection::Input)?;
+            let q = require_node("q", PinDirection::Output)?;
+            let (set, reset, nq) = require_controls()?;
+            instance_lines.push(format!(
+                "as{index} {s} {r} {clk} {set} {reset} {q} {nq} {model_name}"
+            ));
+            model_lines.push(format!(
+                ".model {model_name} d_srff(clk_delay={} set_delay={} reset_delay={} ic={ic} rise_delay={} fall_delay={})",
+                spice_number(delay),
+                spice_number(delay),
+                spice_number(delay),
+                spice_number(XSPICE_MIN_DELAY_SECONDS),
+                spice_number(XSPICE_MIN_DELAY_SECONDS)
+            ));
+        }
+        "d_latch" => {
+            let d = require_node("d", PinDirection::Input)?;
+            let enable = require_node("enable", PinDirection::Input)?;
+            let q = require_node("q", PinDirection::Output)?;
+            let (set, reset, nq) = require_controls()?;
+            instance_lines.push(format!(
+                "as{index} {d} {enable} {set} {reset} {q} {nq} {model_name}"
+            ));
+            model_lines.push(format!(
+                ".model {model_name} d_dlatch(data_delay={} enable_delay={} set_delay={} reset_delay={} ic={ic} rise_delay={} fall_delay={})",
+                spice_number(delay),
+                spice_number(delay),
+                spice_number(delay),
+                spice_number(delay),
+                spice_number(XSPICE_MIN_DELAY_SECONDS),
+                spice_number(XSPICE_MIN_DELAY_SECONDS)
+            ));
+        }
+        _ => {
+            return Err(EngineError::new(
+                "xspice_unsupported_sequential",
+                format!(
+                    "component `{}` is not a native XSPICE sequential primitive",
+                    component.id.as_str()
+                ),
+            ));
+        }
     }
     Ok(())
 }

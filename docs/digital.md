@@ -1,6 +1,6 @@
 # Digital simulation
 
-R3.0 introduces solver-independent digital semantics and a built-in pure-Rust reference engine.
+R3 defines solver-independent digital semantics and a built-in pure-Rust reference engine.
 The reference engine is intentionally independent of XSPICE syntax so future solver adapters can
 be checked for semantic parity.
 
@@ -18,18 +18,26 @@ unknown. Controlling values still dominate (`0 AND X = 0`, `1 OR X = 1`).
 
 ## Components
 
-R3.0 canonical kinds and pins:
+Canonical R3 component kinds:
 
-| Kind | Pins | Parameters |
+| Family | Kinds | Canonical pins |
 | --- | --- | --- |
-| `logic_input` | `out` output | `value` = bool / 0 / 1 / `x` / `z` |
-| `digital_clock` | `out` output | `period`, optional `duty_cycle`, optional `initial` |
-| `logic_output` | `in` input | none |
-| `buffer` | `in`, `out` | optional `delay` |
-| `not_gate` | `in`, `out` | optional `delay` |
-| `and_gate`, `or_gate`, `xor_gate`, `nand_gate`, `nor_gate`, `xnor_gate` | `a`, `b`, `out` | optional `delay` |
+| sources/sinks | `logic_input`, `digital_clock`, `logic_output` | `out`; `out`; `in` |
+| combinational | `buffer`, `not_gate` | `in`, `out` |
+| binary gates | `and_gate`, `or_gate`, `xor_gate`, `nand_gate`, `nor_gate`, `xnor_gate` | `a`, `b`, `out` |
+| bus drive | `tri_state_buffer` | `in`, `enable`, `out` |
+| selection | `mux2`, `demux2`, `decoder2_to_4` | scalar selection pins documented by the kind |
+| latches | `d_latch`, `sr_latch` | data/control inputs, `q`, optional `nq`, optional async `set`/`reset` |
+| flip-flops | `d_flip_flop`, `jk_flip_flop`, `t_flip_flop`, `sr_flip_flop` | data inputs, `clk`, `q`, optional `nq`, optional async `set`/`reset` |
+| bus storage | `register` | `d0..dN`, `clk`, optional `enable`/`reset`, `q0..qN` |
+| counter | `counter` | `clk`, optional `enable`/`reset`, `q0..qN` |
 
-`period` and `delay` are seconds. `duty_cycle` must be greater than zero and less than one.
+Sequential primitives accept optional `initial`, `delay`, and `edge` parameters. `edge` is
+`rising` by default and may be `falling` in the built-in engine. Registers and counters accept
+`width` from 1 through 64; their bit numbering is little-endian (`q0` is the least-significant bit).
+
+`LogicVector` is the public width-aware helper for four-state buses. It converts known vectors to
+and from `u64` without collapsing `X` or `Z`.
 
 ## Event model
 
@@ -42,16 +50,20 @@ The execution-control contract also applies to the built-in digital engine: canc
 wall-clock timeout are checked cooperatively, transition output is bounded, and a hard event-count
 ceiling prevents zero-delay oscillators from running forever.
 
-## Current R3.0 limits
+## Multi-driver and bus semantics
 
-- pure digital circuits only
-- one output/bidirectional driver per digital net
-- no tri-state bus resolution yet
-- no sequential storage elements yet
-- no XSPICE adapter yet
+Digital nets are driver-aware. `Z` releases a net; equal known drivers resolve to that value;
+conflicting known drivers resolve to `X`; any active unknown driver also resolves to `X`.
+Validation reports multi-driver nets as a warning rather than rejecting them.
 
-R3.1 adds an XSPICE adapter and parity proofs against the R3.0 reference semantics.
+Same-time driver events are committed as one event bucket before dependent components evaluate,
+so bus hand-off is deterministic and does not create ordering-dependent glitches.
 
+## Sequential semantics
+
+The built-in engine implements D/SR latches and D/JK/T/SR flip-flops with deterministic
+four-state behavior, async set/reset, rising/falling edge selection, and propagation delay.
+Registers and counters use the same sequential runtime state and event queue.
 
 ## XSPICE adapter
 
