@@ -149,7 +149,13 @@ impl NgSpiceEngine {
             })?;
         let mut child = ChildGuard::new(child);
 
-        let status = wait_for_child(child.child_mut(), run_dir.path(), control)?;
+        let status = wait_for_child_with_files(
+            child.child_mut(),
+            run_dir.path(),
+            control,
+            LOG_FILE,
+            RESULT_FILE,
+        )?;
         child.disarm();
         let log = match read_text_limited(
             &run_dir.path().join(LOG_FILE),
@@ -1249,10 +1255,12 @@ fn parse_wrdata(
     Ok(rows)
 }
 
-fn wait_for_child(
+pub(crate) fn wait_for_child_with_files(
     child: &mut Child,
     run_dir: &Path,
     control: &ExecutionControl,
+    log_file: &str,
+    result_file: &str,
 ) -> Result<ExitStatus, EngineError> {
     let started = Instant::now();
     let poll_interval = Duration::from_millis(control.policy.poll_interval_ms);
@@ -1289,9 +1297,9 @@ fn wait_for_child(
             .retryable(true));
         }
 
-        enforce_file_limit(&run_dir.join(LOG_FILE), "log", control.policy.max_log_bytes)?;
+        enforce_file_limit(&run_dir.join(log_file), "log", control.policy.max_log_bytes)?;
         enforce_file_limit(
-            &run_dir.join(RESULT_FILE),
+            &run_dir.join(result_file),
             "result",
             control.policy.max_output_bytes,
         )?;
@@ -1314,7 +1322,11 @@ fn enforce_file_limit(path: &Path, resource: &str, max_bytes: u64) -> Result<(),
     }
 }
 
-fn enforce_buffer_limit(resource: &str, actual: u64, max_bytes: u64) -> Result<(), EngineError> {
+pub(crate) fn enforce_buffer_limit(
+    resource: &str,
+    actual: u64,
+    max_bytes: u64,
+) -> Result<(), EngineError> {
     if max_bytes != 0 && actual > max_bytes {
         return Err(EngineError::new(
             "execution_resource_limit",
@@ -1324,7 +1336,7 @@ fn enforce_buffer_limit(resource: &str, actual: u64, max_bytes: u64) -> Result<(
     Ok(())
 }
 
-fn read_text_limited(
+pub(crate) fn read_text_limited(
     path: &Path,
     max_bytes: u64,
     resource: &str,
@@ -1345,7 +1357,7 @@ fn read_text_limited(
     })
 }
 
-fn bounded_log(log: &str) -> String {
+pub(crate) fn bounded_log(log: &str) -> String {
     const LIMIT: usize = 4000;
     let trimmed = log.trim();
     if trimmed.chars().count() <= LIMIT {
@@ -1362,7 +1374,7 @@ fn bounded_log(log: &str) -> String {
     format!("…{tail}")
 }
 
-fn extract_warnings(log: &str) -> Vec<String> {
+pub(crate) fn extract_warnings(log: &str) -> Vec<String> {
     log.lines()
         .map(str::trim)
         .filter(|line| {
@@ -1374,21 +1386,21 @@ fn extract_warnings(log: &str) -> Vec<String> {
         .collect()
 }
 
-struct ChildGuard {
+pub(crate) struct ChildGuard {
     child: Child,
     armed: bool,
 }
 
 impl ChildGuard {
-    fn new(child: Child) -> Self {
+    pub(crate) fn new(child: Child) -> Self {
         Self { child, armed: true }
     }
 
-    fn child_mut(&mut self) -> &mut Child {
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
         &mut self.child
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -1402,12 +1414,12 @@ impl Drop for ChildGuard {
     }
 }
 
-struct TempRunDir {
+pub(crate) struct TempRunDir {
     path: PathBuf,
 }
 
 impl TempRunDir {
-    fn create() -> io::Result<Self> {
+    pub(crate) fn create() -> io::Result<Self> {
         for _ in 0..128 {
             let sequence = RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
@@ -1426,7 +1438,7 @@ impl TempRunDir {
         ))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }

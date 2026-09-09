@@ -24,12 +24,13 @@ This repository intentionally contains **no Node.js binding, UI, OXFlow source, 
 - discoverable engine descriptors with capabilities and solver version
 - bounded execution policy with timeout, cancellation, input/output/log limits and child cleanup
 - built-in four-state digital event engine with constants, clocks, combinational gates and propagation delay
+- ngspice/XSPICE digital adapter with VCD-normalized event waveforms and reference-engine parity proofs
 
 ## Install
 
 ```toml
 [dependencies]
-ontologyx-sim-core = "0.6"
+ontologyx-sim-core = "0.7"
 ```
 
 Real analog simulation currently requires `ngspice` on `PATH`.
@@ -99,6 +100,30 @@ The default policy is bounded. Trusted offline callers can opt out explicitly wi
 `ExecutionPolicy::unbounded()`. Sim Core currently bounds wall-clock runtime and solver
 input/output sizes; hard OS memory/CPU sandboxing belongs to the worker/runtime layer.
 
+
+## XSPICE digital backend
+
+`XSpiceEngine` compiles the same digital Circuit IR used by the built-in `DigitalEngine`
+into ngspice XSPICE `d_source`, `d_buffer`, `d_inverter`, `d_and`, `d_or`, `d_xor`,
+`d_nand`, `d_nor`, and `d_xnor` code models. Event-node output is exported through VCD
+and normalized back into `DigitalWaveform`.
+
+```rust
+use ontologyx_sim_core::{SimulationEngine, XSpiceEngine};
+
+let engine = XSpiceEngine::default();
+let info = engine.info();
+assert!(info.available && info.xspice_available);
+
+let result = engine.simulate(&request)?;
+# Ok::<(), ontologyx_sim_core::EngineError>(())
+```
+
+XSPICE basic digital gates impose a minimum representable rise/fall delay. Sim Core exposes
+this as `XSPICE_MIN_DELAY_SECONDS` and emits an `xspice_delay_floor` diagnostic when a
+smaller requested gate delay is clamped. The built-in `DigitalEngine` remains the semantic
+reference and supports true zero-delay events.
+
 ## Repository contract
 
 Create a clean source-state snapshot with:
@@ -115,8 +140,8 @@ Run the full release-readiness gate with:
 ./scripts/verify.sh
 ```
 
-It checks formatting, clippy with warnings denied, all Rust tests, real ngspice integration,
-the runnable example, and a Cargo package dry-run.
+It checks formatting, clippy with warnings denied, all Rust tests, real ngspice/XSPICE integration,
+the runnable examples, and a Cargo package dry-run.
 
 ## Architecture
 
@@ -134,11 +159,14 @@ Simulation engine contract
        v                     v
  DigitalEngine          NgSpiceEngine
  (in-process)                |
-                             v
-                  isolated ngspice process
+       |                 isolated ngspice
        |                     |
-       +----------+----------+
-                  v
+       +---------+-----------+
+                 |
+                 +---- XSpiceEngine
+                 |     event nodes / VCD
+                 |
+                 v
       normalized results + diagnostics
 ```
 

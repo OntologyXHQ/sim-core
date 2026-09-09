@@ -51,3 +51,21 @@ ceiling prevents zero-delay oscillators from running forever.
 - no XSPICE adapter yet
 
 R3.1 adds an XSPICE adapter and parity proofs against the R3.0 reference semantics.
+
+
+## XSPICE adapter
+
+Sim Core 0.7 adds `XSpiceEngine`, which maps the canonical digital component kinds to ngspice
+XSPICE event-driven code models. `logic_input` and `digital_clock` are compiled into a generated
+`d_source` stimulus table; combinational gates map to the corresponding `d_*` code model.
+Event nodes are exported by ngspice as VCD and normalized back into the same transition-based
+`DigitalWaveform` used by the reference engine.
+
+The adapter deliberately keeps `DigitalEngine` as the semantic authority. XSPICE parity tests
+compare final logic values and representable propagation timing. XSPICE basic gates require a
+minimum rise/fall delay, exposed as `XSPICE_MIN_DELAY_SECONDS`; requests below that floor are
+clamped and reported through an `xspice_delay_floor` diagnostic.
+### XSPICE startup and timing normalization
+
+The built-in `DigitalEngine` intentionally initializes nets as `X`. XSPICE initializes digital event nodes to `ZERO` at simulation start. Adapter parity therefore compares causal transitions after startup rather than treating the solver's initialization artifact as a logical propagation event. The adapter exports VCD with an explicit `1e-15` second timescale and forces XSPICE transport-delay mode so representable event timing remains deterministic. Results carry an `xspice_initialization_semantics` informational diagnostic.
+

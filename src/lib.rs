@@ -6,6 +6,7 @@
 //! and ngspice semiconductor/subcircuit instantiation. R2.2 begins public
 //! contract hardening with deterministic result metadata and bounded execution controls.
 //! R3 adds a solver-independent four-state digital event foundation and built-in reference engine.
+//! R3.1 adds an ngspice/XSPICE adapter with VCD-normalized digital waveforms and parity proofs.
 
 pub mod analysis;
 pub mod circuit;
@@ -16,6 +17,7 @@ pub mod ngspice;
 pub mod units;
 pub mod validation;
 pub mod waveform;
+pub mod xspice;
 
 pub use analysis::{AcScale, Analysis, AnalysisDomain, AnalysisKind};
 pub use circuit::{
@@ -38,6 +40,7 @@ pub use waveform::{
     DigitalWaveform, LogicValue, SIMULATION_RESULT_SCHEMA_VERSION, SignalId, SimulationMetadata,
     SimulationResult, SimulationStats, Waveform,
 };
+pub use xspice::{XSPICE_ENGINE_ID, XSPICE_MIN_DELAY_SECONDS, XSpiceEngine, XSpiceInfo};
 
 /// Current public Circuit IR schema version.
 pub const CIRCUIT_SCHEMA_VERSION: u16 = 1;

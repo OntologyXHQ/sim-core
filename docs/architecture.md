@@ -31,3 +31,10 @@ the host process. `ExecutionControl` provides timeout, cancellation and bounded 
 input/output. A child-process guard kills and reaps an unfinished solver on every controlled
 error path before the temporary run directory is removed. This boundary is intentionally
 portable and does not claim OS-level memory/CPU isolation.
+
+
+## Digital engine layering
+
+`DigitalEngine` is the solver-independent reference implementation for four-state event semantics.
+`XSpiceEngine` is an external adapter over ngspice XSPICE. Both consume the same Circuit IR and
+produce the same normalized `DigitalWaveform` result shape; parity tests guard the overlap.

@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.7.0] - 2026-09-09
+
+### Added
+
+- `XSpiceEngine` as a second digital backend using ngspice XSPICE event models
+- XSPICE capability probing and stable `XSpiceInfo` runtime metadata
+- deterministic Circuit IR compilation to `d_source`, `d_buffer`, `d_inverter`, and binary gate code models
+- VCD event-node parsing into normalized `DigitalWaveform` results
+- real reference-engine parity proofs for combinational logic, propagation delay, and clocked events
+- explicit `XSPICE_MIN_DELAY_SECONDS` timing floor and result diagnostic when clamping is required
+
+### Changed
+
+- ngspice process-control primitives are shared internally with the XSPICE adapter so timeout, cancellation, and output limits stay consistent across process-backed engines
+
+### Fixed
+
+- corrected the XSPICE VCD export timescale so sub-nanosecond event timestamps are preserved
+- aligned parity tests with XSPICE ZERO-at-start initialization while keeping the built-in reference engine X-initialized
+- forced XSPICE transport-delay mode to match the canonical DigitalEngine semantics
+
 ## [0.6.0] - 2026-09-09
 
 ### Added

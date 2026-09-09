@@ -114,4 +114,4 @@ Canonical R3.0 digital components use explicit pin contracts:
 
 Gate `delay` and clock `period` are seconds (`Unit::Second`). Clock `duty_cycle` is dimensionless.
 Pure digital nets currently reject multiple output/bidirectional drivers; resolved multi-driver/tri-state buses are deferred to a later digital milestone.
-The upcoming XSPICE adapter must normalize into the same `DigitalWaveform` and pass parity tests against these semantics.
+R3.1 adds `XSpiceEngine` as an external backend over ngspice XSPICE. It consumes the same digital Circuit IR, emits the same `DigitalWaveform`, and is parity-tested against `DigitalEngine` for supported logic and timing. XSPICE basic gate models impose a minimum rise/fall delay; Sim Core exposes that boundary as `XSPICE_MIN_DELAY_SECONDS` and reports `xspice_delay_floor` whenever a smaller requested delay is clamped.

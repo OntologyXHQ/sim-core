@@ -20,6 +20,8 @@ printf '\n== Digital foundation proof ==\n'
 cargo test --test digital_engine -- --nocapture
 printf '\n== Real ngspice integration ==\n'
 ONTOLOGYX_SIM_REQUIRE_NGSPICE=1 cargo test --test ngspice_engine -- --nocapture
+printf '\n== Real XSPICE digital parity ==\n'
+ONTOLOGYX_SIM_REQUIRE_XSPICE=1 cargo test --test xspice_engine -- --nocapture
 printf '\n== Runnable example ==\n'
 cargo run --quiet --example voltage_divider
 cargo run --quiet --example digital_and
