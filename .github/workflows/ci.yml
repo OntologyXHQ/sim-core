@@ -1,0 +1,21 @@
+name: sim-core-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ngspice
+        run: sudo apt-get update && sudo apt-get install -y ngspice
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Verify
+        run: bash scripts/verify.sh

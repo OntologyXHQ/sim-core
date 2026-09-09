@@ -1,0 +1,19 @@
+[package]
+name = "ontologyx-sim-core"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Pure Rust electronics simulation core for analog, digital, and mixed-signal systems"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/ontologyx-sim-core"
+repository = "https://github.com/ontologyxhq/sim-core"
+homepage = "https://github.com/ontologyxhq/sim-core"
+keywords = ["electronics", "simulation", "circuit", "spice", "digital"]
+categories = ["science"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
