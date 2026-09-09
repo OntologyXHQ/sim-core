@@ -16,6 +16,14 @@ grep -q '^name = "ontologyx-sim-core"$' Cargo.toml || {
   echo '[sim-core] crate identity drift' >&2
   exit 1
 }
+if grep -q '^\[alias\]$' Cargo.toml; then
+  echo '[sim-core] Cargo aliases belong in .cargo/config.toml, not Cargo.toml' >&2
+  exit 1
+fi
+if [[ ! -f .cargo/config.toml ]] || ! grep -q '^snapshot = "run --quiet --example snapshot --"$' .cargo/config.toml; then
+  echo '[sim-core] canonical cargo snapshot alias is missing' >&2
+  exit 1
+fi
 if grep -RIn --exclude-dir=.git --exclude-dir=target -E '@ontologyx/sim|napi|Node\.js API' src tests Cargo.toml >/dev/null 2>&1; then
   echo '[sim-core] language-binding ownership leaked into Rust core' >&2
   exit 1

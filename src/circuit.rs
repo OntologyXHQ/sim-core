@@ -72,6 +72,39 @@ impl ComponentKind {
     pub fn logic_gate() -> Self {
         Self::new("logic_gate")
     }
+    pub fn logic_input() -> Self {
+        Self::new("logic_input")
+    }
+    pub fn logic_output() -> Self {
+        Self::new("logic_output")
+    }
+    pub fn digital_clock() -> Self {
+        Self::new("digital_clock")
+    }
+    pub fn buffer() -> Self {
+        Self::new("buffer")
+    }
+    pub fn not_gate() -> Self {
+        Self::new("not_gate")
+    }
+    pub fn and_gate() -> Self {
+        Self::new("and_gate")
+    }
+    pub fn or_gate() -> Self {
+        Self::new("or_gate")
+    }
+    pub fn xor_gate() -> Self {
+        Self::new("xor_gate")
+    }
+    pub fn nand_gate() -> Self {
+        Self::new("nand_gate")
+    }
+    pub fn nor_gate() -> Self {
+        Self::new("nor_gate")
+    }
+    pub fn xnor_gate() -> Self {
+        Self::new("xnor_gate")
+    }
     pub fn diode() -> Self {
         Self::new("diode")
     }

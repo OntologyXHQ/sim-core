@@ -136,6 +136,10 @@ fn real_ngspice_solves_operating_point_voltage_divider() {
     let result = engine
         .simulate(&request)
         .expect("ngspice OP simulation should succeed");
+    assert_eq!(result.metadata.core_version, ontologyx_sim_core::VERSION);
+    assert!(result.metadata.engine_version.is_some());
+    assert_eq!(result.stats.waveform_count, 1);
+    assert_eq!(result.stats.point_count, 1);
     let waveform = analog(&result);
     assert_eq!(waveform.signal.as_str(), "vout");
     assert_eq!(waveform.axis.kind, AxisKind::Scalar);

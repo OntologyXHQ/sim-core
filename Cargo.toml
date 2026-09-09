@@ -1,6 +1,6 @@
 [package]
 name = "ontologyx-sim-core"
-version = "0.3.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Pure Rust electronics simulation core for analog, digital, and mixed-signal systems"
@@ -14,6 +14,7 @@ categories = ["science"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+
 
 [dev-dependencies]
 serde_json = "1"

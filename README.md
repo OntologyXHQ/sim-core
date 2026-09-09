@@ -20,12 +20,16 @@ This repository intentionally contains **no Node.js binding, UI, OXFlow source, 
 - safe inline SPICE model validation
 - normalized scalar/time/DC/frequency waveforms
 - explicit contracts for future digital and mixed-signal engines
+- versioned normalized result metadata and deterministic result statistics
+- discoverable engine descriptors with capabilities and solver version
+- bounded execution policy with timeout, cancellation, input/output/log limits and child cleanup
+- built-in four-state digital event engine with constants, clocks, combinational gates and propagation delay
 
 ## Install
 
 ```toml
 [dependencies]
-ontologyx-sim-core = "0.3"
+ontologyx-sim-core = "0.6"
 ```
 
 Real analog simulation currently requires `ngspice` on `PATH`.
@@ -68,7 +72,42 @@ assert!(validate_circuit(&circuit).is_valid());
 
 For a complete real-ngspice example, see [`examples/voltage_divider.rs`](examples/voltage_divider.rs).
 
+## Controlled execution
+
+Runtime limits are kept outside the serialized circuit/request schema:
+
+```rust
+use ontologyx_sim_core::{
+    CancellationToken, ExecutionControl, ExecutionPolicy, Simulator,
+};
+
+let cancellation = CancellationToken::new();
+let control = ExecutionControl::new(ExecutionPolicy {
+    timeout_ms: 5_000,
+    ..ExecutionPolicy::default()
+})
+.with_cancellation(cancellation.clone());
+
+// From another thread/task:
+// cancellation.cancel();
+
+let result = simulator.simulate_with_control(&request, &control)?;
+# Ok::<(), ontologyx_sim_core::SimulationError>(())
+```
+
+The default policy is bounded. Trusted offline callers can opt out explicitly with
+`ExecutionPolicy::unbounded()`. Sim Core currently bounds wall-clock runtime and solver
+input/output sizes; hard OS memory/CPU sandboxing belongs to the worker/runtime layer.
+
 ## Repository contract
+
+Create a clean source-state snapshot with:
+
+```bash
+cargo snapshot
+```
+
+The archive is written to `~/Downloads` and excludes Git metadata and generated build output.
 
 Run the full release-readiness gate with:
 
@@ -90,14 +129,17 @@ Circuit IR + validation
             v
 Simulation engine contract
             |
-            v
-      ngspice adapter
-            |
-            v
- isolated ngspice process
-            |
-            v
-normalized results + diagnostics
+       +----+----------------+
+       |                     |
+       v                     v
+ DigitalEngine          NgSpiceEngine
+ (in-process)                |
+                             v
+                  isolated ngspice process
+       |                     |
+       +----------+----------+
+                  v
+      normalized results + diagnostics
 ```
 
 Solver-specific syntax stays behind engine adapters. OXSim and OXFlow consume this
@@ -111,6 +153,8 @@ engine; they do not own electrical truth.
 - [SPICE models](docs/spice-models.md)
 - [Architecture](docs/architecture.md)
 - [Compatibility](docs/compatibility.md)
+- [Public contracts](docs/public-contracts.md)
+- [Digital simulation](docs/digital.md)
 - [Roadmap](docs/roadmap.md)
 
 ## Related repositories

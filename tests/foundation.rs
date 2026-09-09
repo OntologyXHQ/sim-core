@@ -111,13 +111,19 @@ impl SimulationEngine for FakeAnalog {
             analyses: BTreeSet::from([AnalysisKind::Transient]),
         }
     }
+    fn version(&self) -> Option<String> {
+        Some("fake-1".to_owned())
+    }
+
     fn simulate(&self, request: &SimulationRequest) -> Result<SimulationResult, EngineError> {
-        Ok(SimulationResult {
-            engine: self.id(),
-            analysis: request.analysis.kind(),
-            waveforms: Vec::new(),
-            diagnostics: Vec::new(),
-        })
+        Ok(SimulationResult::new(
+            self.id(),
+            self.version(),
+            request.analysis.kind(),
+            request.circuit.schema_version,
+            Vec::new(),
+            Vec::new(),
+        ))
     }
 }
 
@@ -193,5 +199,67 @@ fn model_registry_round_trips_through_json() {
     ));
     let json = serde_json::to_string(&source).unwrap();
     let decoded: Circuit = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, source);
+}
+
+#[test]
+fn engine_descriptors_expose_version_and_capabilities() {
+    let mut simulator = Simulator::new();
+    simulator.register_engine(FakeAnalog);
+    let descriptors = simulator.engine_descriptors();
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(descriptors[0].id.as_str(), "fake-analog");
+    assert_eq!(descriptors[0].version.as_deref(), Some("fake-1"));
+    assert!(descriptors[0].capabilities.analog);
+    assert!(
+        descriptors[0]
+            .capabilities
+            .analyses
+            .contains(&AnalysisKind::Transient)
+    );
+}
+
+#[test]
+fn normalized_result_carries_deterministic_provenance_and_stats() {
+    let result = SimulationResult::new(
+        EngineId::new("fake-analog"),
+        Some("fake-1".to_owned()),
+        AnalysisKind::Transient,
+        ontologyx_sim_core::CIRCUIT_SCHEMA_VERSION,
+        Vec::new(),
+        Vec::new(),
+    );
+    assert_eq!(
+        result.metadata.result_schema_version,
+        ontologyx_sim_core::SIMULATION_RESULT_SCHEMA_VERSION
+    );
+    assert_eq!(result.metadata.core_version, ontologyx_sim_core::VERSION);
+    assert_eq!(result.metadata.engine_version.as_deref(), Some("fake-1"));
+    assert_eq!(result.stats.waveform_count, 0);
+    assert_eq!(result.stats.point_count, 0);
+}
+
+#[test]
+fn simulation_error_exposes_stable_top_level_code() {
+    let error = ontologyx_sim_core::SimulationError::NoCompatibleEngine {
+        analysis: AnalysisKind::DigitalTransient,
+    };
+    assert_eq!(error.code(), "no_compatible_engine");
+}
+
+#[test]
+fn normalized_result_round_trips_with_explicit_schema_metadata() {
+    let source = SimulationResult::new(
+        EngineId::new("fake-analog"),
+        Some("fake-1".to_owned()),
+        AnalysisKind::Transient,
+        ontologyx_sim_core::CIRCUIT_SCHEMA_VERSION,
+        Vec::new(),
+        Vec::new(),
+    );
+    let json = serde_json::to_string(&source).unwrap();
+    assert!(json.contains("\"result_schema_version\":1"));
+    assert!(json.contains("\"circuit_schema_version\":1"));
+    let decoded: SimulationResult = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded, source);
 }

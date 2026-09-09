@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CIRCUIT_SCHEMA_VERSION, Circuit, ComponentKind, ModelKind, ParameterValue, SignalDomain,
+    CIRCUIT_SCHEMA_VERSION, Circuit, ComponentKind, ModelKind, ParameterValue, PinDirection,
+    SignalDomain,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -120,7 +121,8 @@ pub fn validate_circuit(circuit: &Circuit) -> ValidationReport {
         }
     }
 
-    let mut components: BTreeMap<&str, BTreeMap<&str, SignalDomain>> = BTreeMap::new();
+    let mut components: BTreeMap<&str, BTreeMap<&str, (SignalDomain, PinDirection)>> =
+        BTreeMap::new();
 
     for (component_index, component) in circuit.components.iter().enumerate() {
         let component_path = format!("components[{component_index}]");
@@ -161,7 +163,7 @@ pub fn validate_circuit(circuit: &Circuit) -> ValidationReport {
                 );
                 continue;
             }
-            if pins.insert(pin_id, pin.domain).is_some() {
+            if pins.insert(pin_id, (pin.domain, pin.direction)).is_some() {
                 report.error(
                     "duplicate_pin_id",
                     format!("{pin_path}.id"),
@@ -274,6 +276,7 @@ pub fn validate_circuit(circuit: &Circuit) -> ValidationReport {
 
         let mut endpoints = BTreeSet::new();
         let mut domains = BTreeSet::new();
+        let mut digital_drivers = 0_usize;
         for (endpoint_index, endpoint) in net.endpoints.iter().enumerate() {
             let endpoint_path = format!("{net_path}.endpoints[{endpoint_index}]");
             let key = (endpoint.component.as_str(), endpoint.pin.as_str());
@@ -293,7 +296,7 @@ pub fn validate_circuit(circuit: &Circuit) -> ValidationReport {
                 );
                 continue;
             };
-            let Some(domain) = pins.get(endpoint.pin.as_str()) else {
+            let Some((domain, direction)) = pins.get(endpoint.pin.as_str()) else {
                 report.error(
                     "unknown_pin",
                     format!("{endpoint_path}.pin"),
@@ -306,6 +309,22 @@ pub fn validate_circuit(circuit: &Circuit) -> ValidationReport {
                 continue;
             };
             domains.insert(*domain);
+            if *domain == SignalDomain::Digital
+                && matches!(
+                    *direction,
+                    PinDirection::Output | PinDirection::Bidirectional
+                )
+            {
+                digital_drivers += 1;
+            }
+        }
+
+        if domains == BTreeSet::from([SignalDomain::Digital]) && digital_drivers > 1 {
+            report.error(
+                "multiple_digital_drivers",
+                format!("{net_path}.endpoints"),
+                "a pure digital net may have only one output/bidirectional driver in R3.0",
+            );
         }
 
         if domains.contains(&SignalDomain::Analog)

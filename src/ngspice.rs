@@ -2,8 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -11,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AcScale, AnalogAxis, AnalogWaveform, Analysis, AnalysisKind, AxisKind, Circuit, Component,
     ComponentKind, Diagnostic, DiagnosticLevel, EngineCapabilities, EngineError, EngineId,
-    ModelDefinition, ModelKind, ModelLanguage, ParameterValue, SignalId, SimulationEngine,
-    SimulationRequest, SimulationResult, Unit, Waveform,
+    ExecutionControl, ModelDefinition, ModelKind, ModelLanguage, ParameterValue, SignalId,
+    SimulationEngine, SimulationRequest, SimulationResult, Unit, Waveform,
 };
 
 static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -86,8 +88,26 @@ impl NgSpiceEngine {
         }
     }
 
-    fn run(&self, request: &SimulationRequest) -> Result<SimulationResult, EngineError> {
+    fn run(
+        &self,
+        request: &SimulationRequest,
+        control: &ExecutionControl,
+    ) -> Result<SimulationResult, EngineError> {
+        control.policy.validate()?;
+        if control.cancellation.is_cancelled() {
+            return Err(EngineError::new(
+                "execution_cancelled",
+                "simulation was cancelled before ngspice execution",
+            ));
+        }
+
         let compiled = compile_request(request)?;
+        enforce_buffer_limit(
+            "netlist",
+            compiled.netlist.len() as u64,
+            control.policy.max_input_bytes,
+        )?;
+
         let run_dir = TempRunDir::create().map_err(|error| {
             EngineError::new(
                 "ngspice_tempdir_failed",
@@ -105,14 +125,17 @@ impl NgSpiceEngine {
             )
         })?;
 
-        let output = Command::new(&self.executable)
+        let child = Command::new(&self.executable)
             .arg("-n")
             .arg("-b")
             .arg("-o")
             .arg(LOG_FILE)
             .arg(NETLIST_FILE)
             .current_dir(run_dir.path())
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
             .map_err(|error| {
                 let code = if error.kind() == io::ErrorKind::NotFound {
                     "ngspice_not_found"
@@ -124,27 +147,46 @@ impl NgSpiceEngine {
                     format!("could not execute `{}`: {error}", self.executable.display()),
                 )
             })?;
+        let mut child = ChildGuard::new(child);
 
-        let log = fs::read_to_string(run_dir.path().join(LOG_FILE)).unwrap_or_default();
-        if !output.status.success() {
+        let status = wait_for_child(child.child_mut(), run_dir.path(), control)?;
+        child.disarm();
+        let log = match read_text_limited(
+            &run_dir.path().join(LOG_FILE),
+            control.policy.max_log_bytes,
+            "log",
+            "ngspice_log_read_failed",
+        ) {
+            Ok(log) => log,
+            Err(error) if error.code() == "ngspice_log_read_failed" => String::new(),
+            Err(error) => return Err(error),
+        };
+        if !status.success() {
             return Err(EngineError::new(
                 "ngspice_failed",
-                format!(
-                    "ngspice exited with {}: {}",
-                    output.status,
-                    bounded_log(&log)
-                ),
+                format!("ngspice exited with {status}: {}", bounded_log(&log)),
             ));
         }
 
-        let table = fs::read_to_string(run_dir.path().join(RESULT_FILE)).map_err(|error| {
-            EngineError::new(
-                "ngspice_result_missing",
-                format!(
-                    "ngspice completed without a readable result table: {error}; log: {}",
-                    bounded_log(&log)
-                ),
-            )
+        let table = read_text_limited(
+            &run_dir.path().join(RESULT_FILE),
+            control.policy.max_output_bytes,
+            "result",
+            "ngspice_result_read_failed",
+        )
+        .map_err(|error| {
+            if error.code() == "execution_resource_limit" {
+                error
+            } else {
+                EngineError::new(
+                    "ngspice_result_missing",
+                    format!(
+                        "ngspice completed without a readable result table: {}; log: {}",
+                        error.message(),
+                        bounded_log(&log)
+                    ),
+                )
+            }
         })?;
         let rows = parse_wrdata(
             &table,
@@ -192,6 +234,7 @@ impl NgSpiceEngine {
             .collect();
 
         let info = self.info();
+        let engine_version = info.version.clone();
         let mut diagnostics = Vec::new();
         if let Some(version) = info.version {
             diagnostics.push(Diagnostic {
@@ -208,12 +251,14 @@ impl NgSpiceEngine {
             });
         }
 
-        Ok(SimulationResult {
-            engine: self.id(),
-            analysis: request.analysis.kind(),
+        Ok(SimulationResult::new(
+            self.id(),
+            engine_version,
+            request.analysis.kind(),
+            request.circuit.schema_version,
             waveforms,
             diagnostics,
-        })
+        ))
     }
 }
 
@@ -236,8 +281,20 @@ impl SimulationEngine for NgSpiceEngine {
         }
     }
 
+    fn version(&self) -> Option<String> {
+        self.info().version
+    }
+
     fn simulate(&self, request: &SimulationRequest) -> Result<SimulationResult, EngineError> {
-        self.run(request)
+        self.run(request, &ExecutionControl::default())
+    }
+
+    fn simulate_with_control(
+        &self,
+        request: &SimulationRequest,
+        control: &ExecutionControl,
+    ) -> Result<SimulationResult, EngineError> {
+        self.run(request, control)
     }
 }
 
@@ -1192,6 +1249,102 @@ fn parse_wrdata(
     Ok(rows)
 }
 
+fn wait_for_child(
+    child: &mut Child,
+    run_dir: &Path,
+    control: &ExecutionControl,
+) -> Result<ExitStatus, EngineError> {
+    let started = Instant::now();
+    let poll_interval = Duration::from_millis(control.policy.poll_interval_ms);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(EngineError::new(
+                    "ngspice_wait_failed",
+                    format!("could not query ngspice process status: {error}"),
+                ));
+            }
+        }
+
+        if control.cancellation.is_cancelled() {
+            return Err(EngineError::new(
+                "execution_cancelled",
+                "ngspice execution was cancelled",
+            ));
+        }
+
+        if control.policy.timeout_ms != 0
+            && started.elapsed() >= Duration::from_millis(control.policy.timeout_ms)
+        {
+            return Err(EngineError::new(
+                "execution_timeout",
+                format!(
+                    "ngspice exceeded execution timeout of {} ms",
+                    control.policy.timeout_ms
+                ),
+            )
+            .retryable(true));
+        }
+
+        enforce_file_limit(&run_dir.join(LOG_FILE), "log", control.policy.max_log_bytes)?;
+        enforce_file_limit(
+            &run_dir.join(RESULT_FILE),
+            "result",
+            control.policy.max_output_bytes,
+        )?;
+
+        thread::sleep(poll_interval);
+    }
+}
+
+fn enforce_file_limit(path: &Path, resource: &str, max_bytes: u64) -> Result<(), EngineError> {
+    if max_bytes == 0 {
+        return Ok(());
+    }
+    match fs::metadata(path) {
+        Ok(metadata) => enforce_buffer_limit(resource, metadata.len(), max_bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(EngineError::new(
+            "ngspice_resource_inspection_failed",
+            format!("could not inspect ngspice {resource} file: {error}"),
+        )),
+    }
+}
+
+fn enforce_buffer_limit(resource: &str, actual: u64, max_bytes: u64) -> Result<(), EngineError> {
+    if max_bytes != 0 && actual > max_bytes {
+        return Err(EngineError::new(
+            "execution_resource_limit",
+            format!("{resource} size {actual} bytes exceeds configured limit of {max_bytes} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn read_text_limited(
+    path: &Path,
+    max_bytes: u64,
+    resource: &str,
+    read_error_code: &str,
+) -> Result<String, EngineError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        EngineError::new(
+            read_error_code,
+            format!("could not inspect ngspice {resource} file: {error}"),
+        )
+    })?;
+    enforce_buffer_limit(resource, metadata.len(), max_bytes)?;
+    fs::read_to_string(path).map_err(|error| {
+        EngineError::new(
+            read_error_code,
+            format!("could not read ngspice {resource} file: {error}"),
+        )
+    })
+}
+
 fn bounded_log(log: &str) -> String {
     const LIMIT: usize = 4000;
     let trimmed = log.trim();
@@ -1219,6 +1372,34 @@ fn extract_warnings(log: &str) -> Vec<String> {
         .take(16)
         .map(str::to_owned)
         .collect()
+}
+
+struct ChildGuard {
+    child: Child,
+    armed: bool,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child, armed: true }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 struct TempRunDir {

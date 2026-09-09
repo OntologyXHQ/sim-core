@@ -4,7 +4,7 @@ OntologyX Sim Core is a Rust library.
 
 ```toml
 [dependencies]
-ontologyx-sim-core = "0.3"
+ontologyx-sim-core = "0.5"
 ```
 
 The current analog engine launches `ngspice` as an isolated child process; ngspice is not bundled.
