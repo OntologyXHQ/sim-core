@@ -12,10 +12,11 @@ use crate::ngspice::{
     read_text_limited, wait_for_child_with_files,
 };
 use crate::{
-    Analysis, AnalysisKind, Circuit, Component, Diagnostic, DiagnosticLevel, DigitalTransition,
-    DigitalWaveform, EngineCapabilities, EngineError, EngineId, ExecutionControl, LogicValue,
-    MAX_DIGITAL_EVENTS, ParameterValue, PinDirection, Probe, Quantity, SignalDomain, SignalId,
-    SimulationEngine, SimulationRequest, SimulationResult, Unit, Waveform,
+    Analysis, AnalysisKind, Circuit, Component, ComponentKind, Diagnostic, DiagnosticLevel,
+    DigitalTransition, DigitalWaveform, EngineCapabilities, EngineError, EngineId,
+    ExecutionControl, LogicValue, MAX_DIGITAL_EVENTS, ParameterValue, PinDirection, Probe,
+    Quantity, SignalDomain, SignalId, SimulationEngine, SimulationRequest, SimulationResult, Unit,
+    Waveform,
 };
 
 pub const XSPICE_ENGINE_ID: &str = "xspice";
@@ -262,6 +263,15 @@ impl SimulationEngine for XSpiceEngine {
         self.info().version
     }
 
+    fn supports_request(&self, request: &SimulationRequest) -> bool {
+        self.capabilities().supports(&request.analysis)
+            && !request
+                .circuit
+                .components
+                .iter()
+                .any(|component| component.kind == ComponentKind::hdl_module())
+    }
+
     fn simulate(&self, request: &SimulationRequest) -> Result<SimulationResult, EngineError> {
         self.run(request, &ExecutionControl::default())
     }
@@ -276,9 +286,9 @@ impl SimulationEngine for XSpiceEngine {
 }
 
 #[derive(Clone, Debug)]
-struct CompiledProbe {
-    signal: String,
-    node: String,
+pub(crate) struct CompiledProbe {
+    pub(crate) signal: String,
+    pub(crate) node: String,
 }
 
 #[derive(Clone, Debug)]
@@ -290,9 +300,9 @@ struct CompiledXSpiceRequest {
 }
 
 #[derive(Clone, Debug)]
-struct SourceSpec {
-    node: String,
-    events: Vec<(f64, LogicValue)>,
+pub(crate) struct SourceSpec {
+    pub(crate) node: String,
+    pub(crate) events: Vec<(f64, LogicValue)>,
 }
 
 fn compile_request(request: &SimulationRequest) -> Result<CompiledXSpiceRequest, EngineError> {
@@ -504,7 +514,7 @@ fn endpoint_net_map(circuit: &Circuit) -> Result<BTreeMap<(String, String), Stri
     Ok(map)
 }
 
-fn gate_contract(
+pub(crate) fn gate_contract(
     kind: &str,
 ) -> Result<(Vec<&'static str>, &'static str, &'static str), EngineError> {
     match kind {
@@ -524,7 +534,7 @@ fn gate_contract(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compile_sequential_xspice(
+pub(crate) fn compile_sequential_xspice(
     component: &Component,
     index: usize,
     endpoint_net: &BTreeMap<(String, String), String>,
@@ -714,7 +724,7 @@ fn compile_probe(
     })
 }
 
-fn compile_stimulus(sources: &[SourceSpec]) -> Result<String, EngineError> {
+pub(crate) fn compile_stimulus(sources: &[SourceSpec]) -> Result<String, EngineError> {
     if sources.is_empty() {
         return Ok(String::new());
     }
@@ -763,7 +773,7 @@ fn compile_stimulus(sources: &[SourceSpec]) -> Result<String, EngineError> {
     Ok(lines.join("\n"))
 }
 
-fn clock_events(
+pub(crate) fn clock_events(
     stop: f64,
     period: f64,
     duty_cycle: f64,
@@ -814,9 +824,12 @@ fn xspice_state(value: LogicValue) -> &'static str {
     }
 }
 
-fn parse_vcd(source: &str, probes: &[CompiledProbe]) -> Result<Vec<Waveform>, EngineError> {
+pub(crate) fn parse_vcd(
+    source: &str,
+    probes: &[CompiledProbe],
+) -> Result<Vec<Waveform>, EngineError> {
     let timescale = parse_vcd_timescale(source)?;
-    let mut id_to_reference = BTreeMap::new();
+    let mut id_to_references = BTreeMap::<String, Vec<String>>::new();
     for line in source.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with("$var ") {
@@ -829,13 +842,18 @@ fn parse_vcd(source: &str, probes: &[CompiledProbe]) -> Result<Vec<Waveform>, En
                 format!("malformed VCD variable declaration `{trimmed}`"),
             ));
         }
-        id_to_reference.insert(
-            tokens[3].to_owned(),
-            tokens[4].trim_start_matches('\\').to_owned(),
-        );
+        let reference = tokens[4].trim_start_matches('\\').to_owned();
+        let references = id_to_references.entry(tokens[3].to_owned()).or_default();
+        if !references.contains(&reference) {
+            references.push(reference);
+        }
     }
 
-    let declared_nodes = id_to_reference.values().cloned().collect::<BTreeSet<_>>();
+    let declared_nodes = id_to_references
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let requested = probes
         .iter()
         .map(|probe| probe.node.as_str())
@@ -887,11 +905,13 @@ fn parse_vcd(source: &str, probes: &[CompiledProbe]) -> Result<Vec<Waveform>, En
             _ => continue,
         };
         let identifier = chars.as_str().trim();
-        let Some(reference) = id_to_reference.get(identifier) else {
+        let Some(references) = id_to_references.get(identifier) else {
             continue;
         };
-        if let Some(history) = histories.get_mut(reference) {
-            push_transition(history, current_time, value);
+        for reference in references {
+            if let Some(history) = histories.get_mut(reference) {
+                push_transition(history, current_time, value);
+            }
         }
     }
 
@@ -981,7 +1001,7 @@ fn push_transition(transitions: &mut Vec<DigitalTransition>, time: f64, value: L
     transitions.push(DigitalTransition { time, value });
 }
 
-fn connected_node(
+pub(crate) fn connected_node(
     component: &Component,
     pin: &str,
     endpoint_net: &BTreeMap<(String, String), String>,
@@ -1003,7 +1023,7 @@ fn connected_node(
     })
 }
 
-fn require_pin(
+pub(crate) fn require_pin(
     component: &Component,
     pin_id: &str,
     direction: PinDirection,
@@ -1029,7 +1049,10 @@ fn require_pin(
     Ok(())
 }
 
-fn required_logic_value(component: &Component, key: &str) -> Result<LogicValue, EngineError> {
+pub(crate) fn required_logic_value(
+    component: &Component,
+    key: &str,
+) -> Result<LogicValue, EngineError> {
     optional_logic_value(component, key)?.ok_or_else(|| {
         component_error(
             component,
@@ -1038,7 +1061,7 @@ fn required_logic_value(component: &Component, key: &str) -> Result<LogicValue, 
     })
 }
 
-fn optional_logic_value(
+pub(crate) fn optional_logic_value(
     component: &Component,
     key: &str,
 ) -> Result<Option<LogicValue>, EngineError> {
@@ -1090,7 +1113,7 @@ fn required_positive_seconds(component: &Component, key: &str) -> Result<f64, En
     Ok(value)
 }
 
-fn optional_non_negative_seconds(
+pub(crate) fn optional_non_negative_seconds(
     component: &Component,
     key: &str,
 ) -> Result<Option<f64>, EngineError> {
@@ -1137,7 +1160,7 @@ fn optional_seconds(component: &Component, key: &str) -> Result<Option<f64>, Eng
     Ok(Some(seconds))
 }
 
-fn duty_cycle(component: &Component) -> Result<f64, EngineError> {
+pub(crate) fn duty_cycle(component: &Component) -> Result<f64, EngineError> {
     let Some(value) = component.parameters.get("duty_cycle") else {
         return Ok(0.5);
     };
@@ -1175,7 +1198,7 @@ fn spice_number(value: f64) -> String {
     format!("{value:.17e}")
 }
 
-fn log_has_xspice_failure(log: &str) -> bool {
+pub(crate) fn log_has_xspice_failure(log: &str) -> bool {
     let lowered = log.to_ascii_lowercase();
     lowered.contains("unknown model type d_")
         || lowered.contains("unknown device type")
@@ -1294,5 +1317,24 @@ mod tests {
         assert!((waveform.transitions[1].time - 5e-9).abs() < 1e-18);
         assert_eq!(waveform.transitions[1].value, LogicValue::One);
         assert_eq!(waveform.transitions[2].value, LogicValue::Zero);
+    }
+    #[test]
+    fn vcd_parser_preserves_alias_references_for_verilator_wrappers() {
+        let vcd = "$timescale 1 ps $end\n$scope module top $end\n$var wire 1 ! ox_n0 $end\n$scope module dut $end\n$var wire 1 ! q $end\n$upscope $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\n#5\n1!\n";
+        let waveforms = parse_vcd(
+            vcd,
+            &[CompiledProbe {
+                signal: "wrapped".to_owned(),
+                node: "ox_n0".to_owned(),
+            }],
+        )
+        .unwrap();
+        let Waveform::Digital(waveform) = &waveforms[0] else {
+            panic!("expected digital waveform");
+        };
+        assert_eq!(waveform.transitions.len(), 2);
+        assert_eq!(waveform.transitions[0].value, LogicValue::Zero);
+        assert_eq!(waveform.transitions[1].value, LogicValue::One);
+        assert!((waveform.transitions[1].time - 5e-12).abs() < 1e-21);
     }
 }

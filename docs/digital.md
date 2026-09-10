@@ -81,3 +81,8 @@ clamped and reported through an `xspice_delay_floor` diagnostic.
 
 The built-in `DigitalEngine` intentionally initializes nets as `X`. XSPICE initializes digital event nodes to `ZERO` at simulation start. Adapter parity therefore compares causal transitions after startup rather than treating the solver's initialization artifact as a logical propagation event. The adapter exports VCD with an explicit `1e-15` second timescale and forces XSPICE transport-delay mode so representable event timing remains deterministic. Results carry an `xspice_initialization_semantics` informational diagnostic.
 
+
+
+## R9.2 co-simulation participant
+
+`DigitalCoSimulationParticipant` exposes selected existing R3 nets as scheduler input/output ports. It reuses the same event queue, propagation delays, four-state resolution and sequential runtime state; it does not rerun `DigitalEngine::simulate` for every macro-step. Externally writable nets must not already have an internal driver.

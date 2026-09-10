@@ -13,8 +13,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install ngspice
-        run: sudo apt-get update && sudo apt-get install -y ngspice
+      - name: Install simulation backends
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap ngspice util-linux verilator
+      - name: Install pinned Renode
+        env:
+          RENODE_VERSION: "1.17.0"
+          RENODE_SHA256: "4ba7c68b59e2447f188ef4b4b112fcccd2802582c460beedceb63b84e5605a5f"
+        run: |
+          curl -fsSL -o /tmp/renode.tar.gz \
+            "https://github.com/renode/renode/releases/download/v${RENODE_VERSION}/renode-${RENODE_VERSION}.linux-portable.tar.gz"
+          echo "${RENODE_SHA256}  /tmp/renode.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/renode
+          tar -xzf /tmp/renode.tar.gz -C /tmp/renode --strip-components=1
+          echo "/tmp/renode" >> "$GITHUB_PATH"
       - name: Install Rust toolchain
         run: rustup show
       - name: Verify

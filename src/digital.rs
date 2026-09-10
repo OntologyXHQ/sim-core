@@ -7,10 +7,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Analysis, AnalysisKind, Circuit, Component, Diagnostic, DiagnosticLevel, DigitalTransition,
-    DigitalWaveform, EngineCapabilities, EngineError, EngineId, ExecutionControl, LogicValue,
-    ParameterValue, PinDirection, Probe, Quantity, SignalDomain, SignalId, SimulationEngine,
-    SimulationRequest, SimulationResult, Unit, VERSION, Waveform,
+    Analysis, AnalysisKind, Circuit, Component, ComponentKind, Diagnostic, DiagnosticLevel,
+    DigitalTransition, DigitalWaveform, EngineCapabilities, EngineError, EngineId,
+    ExecutionControl, LogicValue, ParameterValue, PinDirection, Probe, Quantity, SignalDomain,
+    SignalId, SimulationEngine, SimulationRequest, SimulationResult, Unit, VERSION, Waveform,
 };
 
 pub const DIGITAL_ENGINE_ID: &str = "digital";
@@ -767,6 +767,15 @@ impl SimulationEngine for DigitalEngine {
         Some(VERSION.to_owned())
     }
 
+    fn supports_request(&self, request: &SimulationRequest) -> bool {
+        self.capabilities().supports(&request.analysis)
+            && !request
+                .circuit
+                .components
+                .iter()
+                .any(|component| component.kind == ComponentKind::hdl_module())
+    }
+
     fn simulate(&self, request: &SimulationRequest) -> Result<SimulationResult, EngineError> {
         self.run(request, &ExecutionControl::default())
     }
@@ -778,6 +787,598 @@ impl SimulationEngine for DigitalEngine {
     ) -> Result<SimulationResult, EngineError> {
         self.run(request, control)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DigitalCoSimulationBinding {
+    pub port: String,
+    pub net: String,
+    pub direction: PinDirection,
+}
+
+impl DigitalCoSimulationBinding {
+    pub fn input(port: impl Into<String>, net: impl Into<String>) -> Self {
+        Self {
+            port: port.into(),
+            net: net.into(),
+            direction: PinDirection::Input,
+        }
+    }
+
+    pub fn output(port: impl Into<String>, net: impl Into<String>) -> Self {
+        Self {
+            port: port.into(),
+            net: net.into(),
+            direction: PinDirection::Output,
+        }
+    }
+}
+
+pub struct DigitalCoSimulationParticipant {
+    id: String,
+    ports: Vec<crate::CoSimulationPort>,
+    request: SimulationRequest,
+    bindings: BTreeMap<String, DigitalCoSimulationBinding>,
+    session: Option<DigitalParticipantSession>,
+}
+
+impl DigitalCoSimulationParticipant {
+    pub fn new(
+        id: impl Into<String>,
+        request: SimulationRequest,
+        bindings: Vec<DigitalCoSimulationBinding>,
+    ) -> Result<Self, EngineError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(EngineError::new(
+                "digital_cosim_participant_invalid",
+                "digital co-simulation participant id must not be empty",
+            ));
+        }
+        let program = DigitalProgram::compile(&request)?;
+        let mut ports = Vec::with_capacity(bindings.len());
+        let mut by_name = BTreeMap::new();
+        for binding in bindings {
+            if binding.port.trim().is_empty() || binding.net.trim().is_empty() {
+                return Err(EngineError::new(
+                    "digital_cosim_binding_invalid",
+                    "digital co-simulation port and net names must not be empty",
+                ));
+            }
+            if !program.nets.contains(&binding.net) {
+                return Err(EngineError::new(
+                    "digital_cosim_binding_invalid",
+                    format!(
+                        "digital co-simulation port `{}` references unknown net `{}`",
+                        binding.port, binding.net
+                    ),
+                ));
+            }
+            if !matches!(
+                binding.direction,
+                PinDirection::Input | PinDirection::Output
+            ) {
+                return Err(EngineError::new(
+                    "digital_cosim_binding_invalid",
+                    format!(
+                        "digital co-simulation port `{}` must be input or output",
+                        binding.port
+                    ),
+                ));
+            }
+            if binding.direction == PinDirection::Input
+                && program
+                    .net_drivers
+                    .get(&binding.net)
+                    .is_some_and(|drivers| !drivers.is_empty())
+            {
+                return Err(EngineError::new(
+                    "digital_cosim_input_driven",
+                    format!(
+                        "external input net `{}` already has an internal digital driver",
+                        binding.net
+                    ),
+                ));
+            }
+            let port_name = binding.port.clone();
+            if by_name.insert(port_name.clone(), binding).is_some() {
+                return Err(EngineError::new(
+                    "digital_cosim_binding_duplicate",
+                    format!("digital co-simulation port `{port_name}` is mapped more than once"),
+                ));
+            }
+            let binding = by_name.get(&port_name).expect("inserted binding");
+            ports.push(crate::CoSimulationPort::digital(
+                port_name,
+                binding.direction,
+            ));
+        }
+        if ports.is_empty() {
+            return Err(EngineError::new(
+                "digital_cosim_binding_missing",
+                "digital co-simulation participant requires at least one port binding",
+            ));
+        }
+        Ok(Self {
+            id,
+            ports,
+            request,
+            bindings: by_name,
+            session: None,
+        })
+    }
+}
+
+impl crate::CoSimulationParticipant for DigitalCoSimulationParticipant {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn ports(&self) -> &[crate::CoSimulationPort] {
+        &self.ports
+    }
+
+    fn current_time(&self) -> crate::CoSimulationTime {
+        self.session
+            .as_ref()
+            .map_or(crate::CoSimulationTime::ZERO, |session| {
+                session.current_time
+            })
+    }
+
+    fn initialize(&mut self, control: &ExecutionControl) -> Result<(), EngineError> {
+        control.policy.validate()?;
+        if control.cancellation.is_cancelled() {
+            return Err(execution_cancelled());
+        }
+        let external_inputs = self
+            .bindings
+            .values()
+            .filter(|binding| binding.direction == PinDirection::Input)
+            .map(|binding| binding.net.clone())
+            .collect::<BTreeSet<_>>();
+        let mut session = DigitalParticipantSession::new(&self.request, external_inputs, control)?;
+        session.advance_to(crate::CoSimulationTime::ZERO, control)?;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    fn next_event_time(&self) -> Option<crate::CoSimulationTime> {
+        self.session
+            .as_ref()
+            .and_then(DigitalParticipantSession::next_event_time)
+    }
+
+    fn advance_to(
+        &mut self,
+        target: crate::CoSimulationTime,
+        control: &ExecutionControl,
+    ) -> Result<(), EngineError> {
+        self.session_mut()?.advance_to(target, control)
+    }
+
+    fn read_output(&self, port: &str) -> Result<crate::CoSimulationValue, EngineError> {
+        let binding = self.bindings.get(port).ok_or_else(|| {
+            EngineError::new(
+                "digital_cosim_port_missing",
+                format!(
+                    "digital co-simulation participant `{}` has no port `{port}`",
+                    self.id
+                ),
+            )
+        })?;
+        if binding.direction != PinDirection::Output {
+            return Err(EngineError::new(
+                "digital_cosim_port_direction",
+                format!("digital co-simulation port `{port}` is not an output"),
+            ));
+        }
+        Ok(crate::CoSimulationValue::Digital(
+            self.session_ref()?.read_net(&binding.net)?,
+        ))
+    }
+
+    fn write_input(
+        &mut self,
+        port: &str,
+        time: crate::CoSimulationTime,
+        value: &crate::CoSimulationValue,
+        control: &ExecutionControl,
+    ) -> Result<bool, EngineError> {
+        let binding = self.bindings.get(port).cloned().ok_or_else(|| {
+            EngineError::new(
+                "digital_cosim_port_missing",
+                format!(
+                    "digital co-simulation participant `{}` has no port `{port}`",
+                    self.id
+                ),
+            )
+        })?;
+        if binding.direction != PinDirection::Input {
+            return Err(EngineError::new(
+                "digital_cosim_port_direction",
+                format!("digital co-simulation port `{port}` is not an input"),
+            ));
+        }
+        let crate::CoSimulationValue::Digital(value) = value else {
+            return Err(EngineError::new(
+                "digital_cosim_domain_mismatch",
+                format!("digital co-simulation port `{port}` requires a digital value"),
+            ));
+        };
+        self.session_mut()?
+            .write_external(&binding.net, time, *value, control)
+    }
+}
+
+impl DigitalCoSimulationParticipant {
+    fn session_ref(&self) -> Result<&DigitalParticipantSession, EngineError> {
+        self.session.as_ref().ok_or_else(|| {
+            EngineError::new(
+                "digital_cosim_not_initialized",
+                format!(
+                    "digital co-simulation participant `{}` is not initialized",
+                    self.id
+                ),
+            )
+        })
+    }
+
+    fn session_mut(&mut self) -> Result<&mut DigitalParticipantSession, EngineError> {
+        let id = self.id.clone();
+        self.session.as_mut().ok_or_else(|| {
+            EngineError::new(
+                "digital_cosim_not_initialized",
+                format!("digital co-simulation participant `{id}` is not initialized"),
+            )
+        })
+    }
+}
+
+struct DigitalParticipantSession {
+    program: DigitalProgram,
+    stop: f64,
+    current_time: crate::CoSimulationTime,
+    net_values: BTreeMap<String, LogicValue>,
+    driver_values: BTreeMap<DriverKey, LogicValue>,
+    runtime_states: Vec<RuntimeState>,
+    queue: BinaryHeap<ScheduledEvent>,
+    sequence: u64,
+    scheduled_events: usize,
+    processed_events: usize,
+    external_inputs: BTreeSet<String>,
+    started: Instant,
+}
+
+impl DigitalParticipantSession {
+    fn new(
+        request: &SimulationRequest,
+        external_inputs: BTreeSet<String>,
+        control: &ExecutionControl,
+    ) -> Result<Self, EngineError> {
+        let Analysis::DigitalTransient { stop } = &request.analysis else {
+            return Err(EngineError::new(
+                "digital_cosim_analysis_invalid",
+                "digital co-simulation participant requires digital_transient analysis",
+            ));
+        };
+        let stop = *stop;
+        let program = DigitalProgram::compile(request)?;
+        for net in &external_inputs {
+            if !program.nets.contains(net) {
+                return Err(EngineError::new(
+                    "digital_cosim_binding_invalid",
+                    format!("external input references unknown net `{net}`"),
+                ));
+            }
+            if program
+                .net_drivers
+                .get(net)
+                .is_some_and(|drivers| !drivers.is_empty())
+            {
+                return Err(EngineError::new(
+                    "digital_cosim_input_driven",
+                    format!("external input net `{net}` already has an internal digital driver"),
+                ));
+            }
+        }
+
+        let net_values = program
+            .nets
+            .iter()
+            .map(|net| (net.clone(), LogicValue::X))
+            .collect::<BTreeMap<_, _>>();
+        let mut driver_values = BTreeMap::<DriverKey, LogicValue>::new();
+        for drivers in program.net_drivers.values() {
+            for driver in drivers {
+                driver_values.insert(*driver, LogicValue::Z);
+            }
+        }
+        let runtime_states = program
+            .components
+            .iter()
+            .map(RuntimeState::for_component)
+            .collect::<Vec<_>>();
+        let mut session = Self {
+            program,
+            stop,
+            current_time: crate::CoSimulationTime::ZERO,
+            net_values,
+            driver_values,
+            runtime_states,
+            queue: BinaryHeap::new(),
+            sequence: 0,
+            scheduled_events: 0,
+            processed_events: 0,
+            external_inputs,
+            started: Instant::now(),
+        };
+        session.schedule_initial(control)?;
+        Ok(session)
+    }
+
+    fn schedule_initial(&mut self, control: &ExecutionControl) -> Result<(), EngineError> {
+        for (component_index, component) in self.program.components.iter().enumerate() {
+            match component.primitive {
+                DigitalPrimitive::Constant(value) => schedule_output(
+                    &mut self.queue,
+                    &mut self.sequence,
+                    &mut self.scheduled_events,
+                    0.0,
+                    component_index,
+                    0,
+                    value,
+                )?,
+                DigitalPrimitive::Clock {
+                    period,
+                    duty_cycle,
+                    initial,
+                } => schedule_clock(
+                    &mut self.queue,
+                    &mut self.sequence,
+                    &mut self.scheduled_events,
+                    component_index,
+                    self.stop,
+                    period,
+                    duty_cycle,
+                    initial,
+                    control,
+                    self.started,
+                )?,
+                DigitalPrimitive::DLatch
+                | DigitalPrimitive::SRLatch
+                | DigitalPrimitive::DFlipFlop { .. }
+                | DigitalPrimitive::JKFlipFlop { .. }
+                | DigitalPrimitive::TFlipFlop { .. }
+                | DigitalPrimitive::SRFlipFlop { .. }
+                | DigitalPrimitive::Register { .. }
+                | DigitalPrimitive::Counter { .. } => {
+                    let outputs = initial_outputs(component, &self.runtime_states[component_index]);
+                    for (output_index, value) in outputs.into_iter().enumerate() {
+                        schedule_output(
+                            &mut self.queue,
+                            &mut self.sequence,
+                            &mut self.scheduled_events,
+                            0.0,
+                            component_index,
+                            output_index,
+                            value,
+                        )?;
+                    }
+                }
+                DigitalPrimitive::Gate(_)
+                | DigitalPrimitive::TriState
+                | DigitalPrimitive::Mux2
+                | DigitalPrimitive::Demux2
+                | DigitalPrimitive::Decoder2To4
+                | DigitalPrimitive::Sink => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn next_event_time(&self) -> Option<crate::CoSimulationTime> {
+        self.queue.peek().and_then(|event| {
+            digital_seconds_to_future_cosim_time(event.time, self.current_time).ok()
+        })
+    }
+
+    fn advance_to(
+        &mut self,
+        target: crate::CoSimulationTime,
+        control: &ExecutionControl,
+    ) -> Result<(), EngineError> {
+        if target < self.current_time {
+            return Err(EngineError::new(
+                "digital_cosim_time_invalid",
+                "digital co-simulation participant cannot move backwards in time",
+            ));
+        }
+        let target_seconds = target.as_seconds();
+        if target_seconds > self.stop + 0.5e-12 {
+            return Err(EngineError::new(
+                "digital_cosim_time_invalid",
+                format!(
+                    "digital co-simulation target exceeds request stop time of {} s",
+                    self.stop
+                ),
+            ));
+        }
+        self.process_until(target_seconds, control)?;
+        self.current_time = target;
+        Ok(())
+    }
+
+    fn write_external(
+        &mut self,
+        net: &str,
+        time: crate::CoSimulationTime,
+        value: LogicValue,
+        control: &ExecutionControl,
+    ) -> Result<bool, EngineError> {
+        if time != self.current_time {
+            return Err(EngineError::new(
+                "digital_cosim_time_invalid",
+                "digital co-simulation input writes must occur at the participant current time",
+            ));
+        }
+        if !self.external_inputs.contains(net) {
+            return Err(EngineError::new(
+                "digital_cosim_binding_invalid",
+                format!("net `{net}` is not an external digital input"),
+            ));
+        }
+        let current = self.net_values.get(net).copied().unwrap_or(LogicValue::X);
+        if current == value {
+            return Ok(false);
+        }
+        self.net_values.insert(net.to_owned(), value);
+        let dependents = self
+            .program
+            .dependents
+            .get(net)
+            .cloned()
+            .unwrap_or_default();
+        self.evaluate_components(&dependents, self.current_time.as_seconds(), control)?;
+        self.process_until(self.current_time.as_seconds(), control)?;
+        Ok(true)
+    }
+
+    fn read_net(&self, net: &str) -> Result<LogicValue, EngineError> {
+        self.net_values.get(net).copied().ok_or_else(|| {
+            EngineError::new(
+                "digital_cosim_binding_invalid",
+                format!("digital co-simulation output references unknown net `{net}`"),
+            )
+        })
+    }
+
+    fn process_until(
+        &mut self,
+        target: f64,
+        control: &ExecutionControl,
+    ) -> Result<(), EngineError> {
+        loop {
+            check_execution(control, self.started)?;
+            let Some(next) = self.queue.peek() else {
+                break;
+            };
+            if next.time > target + 0.5e-12 {
+                break;
+            }
+            let first = self.queue.pop().expect("peeked digital event exists");
+            let time = first.time;
+            let mut batch = vec![first];
+            while self
+                .queue
+                .peek()
+                .is_some_and(|event| event.time.to_bits() == time.to_bits())
+            {
+                batch.push(self.queue.pop().expect("peeked digital event exists"));
+            }
+            self.processed_events += batch.len();
+            if self.processed_events > MAX_DIGITAL_EVENTS {
+                return Err(event_limit_error());
+            }
+
+            let mut affected_nets = BTreeSet::new();
+            for event in batch {
+                let previous = self
+                    .driver_values
+                    .insert(event.driver, event.value)
+                    .unwrap_or(LogicValue::Z);
+                if previous != event.value {
+                    let net = &self.program.components[event.driver.component].output_nets
+                        [event.driver.output]
+                        .1;
+                    affected_nets.insert(net.clone());
+                }
+            }
+
+            let mut affected_components = BTreeSet::new();
+            for net in affected_nets {
+                let resolved = resolve_net(
+                    self.program
+                        .net_drivers
+                        .get(&net)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    &self.driver_values,
+                );
+                let current = self.net_values.get(&net).copied().unwrap_or(LogicValue::X);
+                if resolved == current {
+                    continue;
+                }
+                self.net_values.insert(net.clone(), resolved);
+                if let Some(dependents) = self.program.dependents.get(&net) {
+                    affected_components.extend(dependents.iter().copied());
+                }
+            }
+            let components = affected_components.into_iter().collect::<Vec<_>>();
+            self.evaluate_components(&components, time, control)?;
+        }
+        Ok(())
+    }
+
+    fn evaluate_components(
+        &mut self,
+        component_indices: &[usize],
+        time: f64,
+        control: &ExecutionControl,
+    ) -> Result<(), EngineError> {
+        check_execution(control, self.started)?;
+        for &component_index in component_indices {
+            let component = &self.program.components[component_index];
+            let Some(values) =
+                component.evaluate(&self.net_values, &mut self.runtime_states[component_index])
+            else {
+                continue;
+            };
+            for (output_index, value) in values.into_iter().enumerate() {
+                if output_index >= component.output_nets.len() {
+                    break;
+                }
+                let output_time = time + component.delay;
+                if output_time <= self.stop {
+                    schedule_output(
+                        &mut self.queue,
+                        &mut self.sequence,
+                        &mut self.scheduled_events,
+                        output_time,
+                        component_index,
+                        output_index,
+                        value,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn digital_seconds_to_future_cosim_time(
+    seconds: f64,
+    current: crate::CoSimulationTime,
+) -> Result<crate::CoSimulationTime, EngineError> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(EngineError::new(
+            "digital_cosim_time_invalid",
+            "digital event time must be finite and non-negative",
+        ));
+    }
+    let ticks = (seconds * crate::COSIM_TIMEBASE_HZ as f64).ceil();
+    if ticks > u64::MAX as f64 {
+        return Err(EngineError::new(
+            "digital_cosim_time_invalid",
+            "digital event time exceeds co-simulation timebase range",
+        ));
+    }
+    let mut time = crate::CoSimulationTime::from_picoseconds(ticks as u64);
+    if time <= current && seconds > current.as_seconds() {
+        time =
+            crate::CoSimulationTime::from_picoseconds(current.as_picoseconds().saturating_add(1));
+    }
+    Ok(time)
 }
 
 impl LogicValue {

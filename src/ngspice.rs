@@ -1,9 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -291,6 +295,15 @@ impl SimulationEngine for NgSpiceEngine {
         self.info().version
     }
 
+    fn supports_request(&self, request: &SimulationRequest) -> bool {
+        self.capabilities().supports(&request.analysis)
+            && !request
+                .circuit
+                .components
+                .iter()
+                .any(|component| component.kind == ComponentKind::hdl_module())
+    }
+
     fn simulate(&self, request: &SimulationRequest) -> Result<SimulationResult, EngineError> {
         self.run(request, &ExecutionControl::default())
     }
@@ -320,9 +333,9 @@ struct CompiledRequest {
 }
 
 #[derive(Clone, Debug)]
-struct OwnedTableRow {
-    axis: f64,
-    values: Vec<(f64, f64)>,
+pub(crate) struct OwnedTableRow {
+    pub(crate) axis: f64,
+    pub(crate) values: Vec<(f64, f64)>,
 }
 
 fn compile_request(request: &SimulationRequest) -> Result<CompiledRequest, EngineError> {
@@ -378,7 +391,7 @@ fn compile_request(request: &SimulationRequest) -> Result<CompiledRequest, Engin
 }
 
 #[derive(Clone, Debug)]
-struct Topology {
+pub(crate) struct Topology {
     endpoint_node: BTreeMap<(String, String), String>,
     endpoint_net: BTreeMap<(String, String), String>,
     source_names: BTreeMap<String, (String, Unit)>,
@@ -479,7 +492,71 @@ impl Topology {
         })
     }
 
-    fn node_for(&self, component: &Component, pin: &str) -> Result<&str, EngineError> {
+    pub(crate) fn build_with_net_nodes(
+        circuit: &Circuit,
+        net_nodes: BTreeMap<String, String>,
+    ) -> Result<Self, EngineError> {
+        for net in &circuit.nets {
+            if !net_nodes.contains_key(net.id.as_str()) {
+                return Err(EngineError::new(
+                    "ngspice_topology_missing_net",
+                    format!("custom topology is missing net `{}`", net.id.as_str()),
+                ));
+            }
+        }
+
+        let mut endpoint_node = BTreeMap::new();
+        let mut endpoint_net = BTreeMap::new();
+        for net in &circuit.nets {
+            let node = net_nodes
+                .get(net.id.as_str())
+                .expect("custom topology was checked for every circuit net");
+            for endpoint in &net.endpoints {
+                let key = (
+                    endpoint.component.as_str().to_owned(),
+                    endpoint.pin.as_str().to_owned(),
+                );
+                if endpoint_node.insert(key.clone(), node.clone()).is_some() {
+                    return Err(EngineError::new(
+                        "ngspice_endpoint_multiple_nets",
+                        format!(
+                            "endpoint `{}.{}` belongs to more than one net",
+                            key.0, key.1
+                        ),
+                    ));
+                }
+                endpoint_net.insert(key, net.id.as_str().to_owned());
+            }
+        }
+
+        let mut source_names = BTreeMap::new();
+        let mut voltage_index = 0usize;
+        let mut current_index = 0usize;
+        for component in &circuit.components {
+            if component.kind == ComponentKind::voltage_source() {
+                voltage_index += 1;
+                source_names.insert(
+                    component.id.as_str().to_owned(),
+                    (format!("V{voltage_index}"), Unit::Volt),
+                );
+            } else if component.kind == ComponentKind::current_source() {
+                current_index += 1;
+                source_names.insert(
+                    component.id.as_str().to_owned(),
+                    (format!("I{current_index}"), Unit::Ampere),
+                );
+            }
+        }
+
+        Ok(Self {
+            endpoint_node,
+            endpoint_net,
+            source_names,
+            net_nodes,
+        })
+    }
+
+    pub(crate) fn node_for(&self, component: &Component, pin: &str) -> Result<&str, EngineError> {
         self.endpoint_node
             .get(&(component.id.as_str().to_owned(), pin.to_owned()))
             .map(String::as_str)
@@ -501,12 +578,14 @@ struct CompiledModel {
 }
 
 #[derive(Clone, Debug, Default)]
-struct CompiledModelRegistry {
+pub(crate) struct CompiledModelRegistry {
     entries: BTreeMap<String, CompiledModel>,
-    netlist: Vec<String>,
+    pub(crate) netlist: Vec<String>,
 }
 
-fn compile_models(models: &[ModelDefinition]) -> Result<CompiledModelRegistry, EngineError> {
+pub(crate) fn compile_models(
+    models: &[ModelDefinition],
+) -> Result<CompiledModelRegistry, EngineError> {
     let total_bytes = models.iter().map(|model| model.source.len()).sum::<usize>();
     if total_bytes > MAX_INLINE_MODEL_REGISTRY_BYTES {
         return Err(EngineError::new(
@@ -588,6 +667,15 @@ fn validate_spice_model_source(model: &ModelDefinition) -> Result<SpiceModelMeta
     let expected_directive = match model.kind {
         ModelKind::Device => ".model",
         ModelKind::Subcircuit => ".subckt",
+        ModelKind::Module => {
+            return Err(EngineError::new(
+                "ngspice_model_kind_unsupported",
+                format!(
+                    "model `{}` is an HDL module, not a SPICE model",
+                    model.id.as_str()
+                ),
+            ));
+        }
     };
     let mut declaration_found = false;
     let mut subcircuit_end_found = false;
@@ -645,6 +733,9 @@ fn validate_spice_model_source(model: &ModelDefinition) -> Result<SpiceModelMeta
                                 })
                                 .count();
                             metadata.subcircuit_port_count = Some(port_count);
+                        }
+                        ModelKind::Module => {
+                            unreachable!("HDL modules are rejected before SPICE parsing")
                         }
                     }
                 }
@@ -776,7 +867,7 @@ fn required_subcircuit_model<'a>(
     Ok(model)
 }
 
-fn compile_component(
+pub(crate) fn compile_component(
     index: usize,
     component: &Component,
     topology: &Topology,
@@ -1036,12 +1127,12 @@ fn compile_analysis(
                 true,
             ))
         }
-        Analysis::DigitalTransient { .. } | Analysis::MixedSignalTransient { .. } => {
-            Err(EngineError::new(
-                "ngspice_analysis_unsupported",
-                "R2 ngspice engine supports analog analyses only; digital/mixed-signal lands in the next engine slice",
-            ))
-        }
+        Analysis::DigitalTransient { .. }
+        | Analysis::MixedSignalTransient { .. }
+        | Analysis::FirmwareTransient { .. } => Err(EngineError::new(
+            "ngspice_analysis_unsupported",
+            "R2 ngspice engine supports analog analyses only; digital/mixed-signal lands in the next engine slice",
+        )),
     }
 }
 
@@ -1184,11 +1275,11 @@ fn component_error(component: &Component, message: impl Into<String>) -> EngineE
     )
 }
 
-fn spice_number(value: f64) -> String {
+pub(crate) fn spice_number(value: f64) -> String {
     format!("{value:.17e}")
 }
 
-fn parse_wrdata(
+pub(crate) fn parse_wrdata(
     source: &str,
     signal_count: usize,
     complex: bool,
@@ -1600,4 +1691,741 @@ mod tests {
         .expect_err("unterminated subcircuit must fail");
         assert_eq!(missing_ends.code, "ngspice_model_subcircuit_unterminated");
     }
+}
+
+// R9.3 -----------------------------------------------------------------------
+//
+// SharedSpice remains in its own helper process. This gives one library instance
+// per participant, keeps callbacks out of the Rust scheduler process, and turns
+// native solver/library failures into ordinary participant failures.
+
+pub const NGSPICE_COSIM_DEFAULT_HELPER: &str = "ontologyx-ngspice-cosim-helper";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NgSpiceCoSimulationBinding {
+    pub port: String,
+    pub net: String,
+    pub direction: crate::PinDirection,
+}
+
+impl NgSpiceCoSimulationBinding {
+    pub fn input(port: impl Into<String>, net: impl Into<String>) -> Self {
+        Self {
+            port: port.into(),
+            net: net.into(),
+            direction: crate::PinDirection::Input,
+        }
+    }
+
+    pub fn output(port: impl Into<String>, net: impl Into<String>) -> Self {
+        Self {
+            port: port.into(),
+            net: net.into(),
+            direction: crate::PinDirection::Output,
+        }
+    }
+
+    fn validate(&self) -> Result<(), EngineError> {
+        if self.port.trim().is_empty()
+            || !self
+                .port
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            || self
+                .port
+                .chars()
+                .next()
+                .is_none_or(|character| !(character.is_ascii_alphabetic() || character == '_'))
+        {
+            return Err(EngineError::new(
+                "ngspice_cosim_binding_invalid",
+                format!(
+                    "ngspice co-simulation port `{}` is not a safe identifier",
+                    self.port
+                ),
+            ));
+        }
+        if self.net.trim().is_empty() {
+            return Err(EngineError::new(
+                "ngspice_cosim_binding_invalid",
+                format!(
+                    "ngspice co-simulation port `{}` has an empty net id",
+                    self.port
+                ),
+            ));
+        }
+        if !matches!(
+            self.direction,
+            crate::PinDirection::Input | crate::PinDirection::Output
+        ) {
+            return Err(EngineError::new(
+                "ngspice_cosim_binding_invalid",
+                "R9.3 SharedSpice ports are explicit voltage inputs or voltage outputs; bidirectional analog coupling requires an explicit bridge participant",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NgSpiceCoSimulationConfig {
+    pub helper: PathBuf,
+    pub stop: crate::CoSimulationTime,
+    pub internal_step: crate::CoSimulationTime,
+}
+
+impl NgSpiceCoSimulationConfig {
+    pub fn new(stop: crate::CoSimulationTime, internal_step: crate::CoSimulationTime) -> Self {
+        Self {
+            helper: PathBuf::from(NGSPICE_COSIM_DEFAULT_HELPER),
+            stop,
+            internal_step,
+        }
+    }
+
+    pub fn with_helper(mut self, helper: impl Into<PathBuf>) -> Self {
+        self.helper = helper.into();
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if self.helper.as_os_str().is_empty() {
+            return Err(EngineError::new(
+                "ngspice_cosim_config_invalid",
+                "ngspice co-simulation helper path must not be empty",
+            ));
+        }
+        if self.stop == crate::CoSimulationTime::ZERO {
+            return Err(EngineError::new(
+                "ngspice_cosim_config_invalid",
+                "ngspice co-simulation stop time must be greater than zero",
+            ));
+        }
+        if self.internal_step == crate::CoSimulationTime::ZERO || self.internal_step > self.stop {
+            return Err(EngineError::new(
+                "ngspice_cosim_config_invalid",
+                "ngspice internal transient step must be greater than zero and not exceed stop time",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub struct NgSpiceCoSimulationParticipant {
+    id: String,
+    circuit: Circuit,
+    config: NgSpiceCoSimulationConfig,
+    bindings: Vec<NgSpiceCoSimulationBinding>,
+    ports: Vec<crate::CoSimulationPort>,
+    session: Option<NgSpiceCoSimulationSession>,
+}
+
+impl NgSpiceCoSimulationParticipant {
+    pub fn new(
+        id: impl Into<String>,
+        circuit: Circuit,
+        config: NgSpiceCoSimulationConfig,
+        bindings: Vec<NgSpiceCoSimulationBinding>,
+    ) -> Result<Self, EngineError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(EngineError::new(
+                "ngspice_cosim_participant_invalid",
+                "ngspice co-simulation participant id must not be empty",
+            ));
+        }
+        config.validate()?;
+        if bindings.is_empty() {
+            return Err(EngineError::new(
+                "ngspice_cosim_binding_invalid",
+                "ngspice co-simulation requires at least one analog binding",
+            ));
+        }
+        let topology = Topology::build(&circuit)?;
+        let mut names = BTreeSet::new();
+        let mut input_nets = BTreeSet::new();
+        for binding in &bindings {
+            binding.validate()?;
+            if !names.insert(binding.port.clone()) {
+                return Err(EngineError::new(
+                    "ngspice_cosim_binding_invalid",
+                    format!("duplicate ngspice co-simulation port `{}`", binding.port),
+                ));
+            }
+            if !topology.net_nodes.contains_key(&binding.net) {
+                return Err(EngineError::new(
+                    "ngspice_cosim_binding_invalid",
+                    format!(
+                        "ngspice co-simulation port `{}` references unknown net `{}`",
+                        binding.port, binding.net
+                    ),
+                ));
+            }
+            if binding.direction == crate::PinDirection::Input
+                && !input_nets.insert(binding.net.clone())
+            {
+                return Err(EngineError::new(
+                    "ngspice_cosim_binding_invalid",
+                    format!(
+                        "net `{}` has more than one external voltage driver",
+                        binding.net
+                    ),
+                ));
+            }
+        }
+        let ports = bindings
+            .iter()
+            .map(|binding| {
+                crate::CoSimulationPort::analog(&binding.port, binding.direction, Unit::Volt)
+            })
+            .collect();
+        Ok(Self {
+            id,
+            circuit,
+            config,
+            bindings,
+            ports,
+            session: None,
+        })
+    }
+
+    fn binding(&self, port: &str) -> Result<(usize, &NgSpiceCoSimulationBinding), EngineError> {
+        self.bindings
+            .iter()
+            .enumerate()
+            .find(|(_, binding)| binding.port == port)
+            .ok_or_else(|| {
+                EngineError::new(
+                    "ngspice_cosim_port_missing",
+                    format!(
+                        "ngspice co-simulation participant `{}` has no port `{port}`",
+                        self.id
+                    ),
+                )
+            })
+    }
+
+    fn session_ref(&self) -> Result<&NgSpiceCoSimulationSession, EngineError> {
+        self.session.as_ref().ok_or_else(|| {
+            EngineError::new(
+                "ngspice_cosim_not_initialized",
+                format!(
+                    "ngspice co-simulation participant `{}` is not initialized",
+                    self.id
+                ),
+            )
+        })
+    }
+
+    fn session_mut(&mut self) -> Result<&mut NgSpiceCoSimulationSession, EngineError> {
+        let id = self.id.clone();
+        self.session.as_mut().ok_or_else(|| {
+            EngineError::new(
+                "ngspice_cosim_not_initialized",
+                format!("ngspice co-simulation participant `{id}` is not initialized"),
+            )
+        })
+    }
+}
+
+impl crate::CoSimulationParticipant for NgSpiceCoSimulationParticipant {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn ports(&self) -> &[crate::CoSimulationPort] {
+        &self.ports
+    }
+
+    fn current_time(&self) -> crate::CoSimulationTime {
+        self.session
+            .as_ref()
+            .map_or(crate::CoSimulationTime::ZERO, |session| {
+                session.current_time
+            })
+    }
+
+    fn initialize(&mut self, control: &ExecutionControl) -> Result<(), EngineError> {
+        check_ngspice_cosim_control(control)?;
+        let compiled = compile_cosim_netlist(&self.circuit, &self.config, &self.bindings)?;
+        enforce_buffer_limit(
+            "ngspice co-simulation netlist",
+            compiled.netlist.len() as u64,
+            control.policy.max_input_bytes,
+        )?;
+        self.session = Some(NgSpiceCoSimulationSession::spawn(
+            &self.config,
+            &compiled,
+            control,
+        )?);
+        Ok(())
+    }
+
+    fn advance_to(
+        &mut self,
+        target: crate::CoSimulationTime,
+        control: &ExecutionControl,
+    ) -> Result<(), EngineError> {
+        if target > self.config.stop {
+            return Err(EngineError::new(
+                "ngspice_cosim_time_invalid",
+                "ngspice co-simulation target exceeds the participant configured stop time",
+            ));
+        }
+        self.session_mut()?.advance_to(target, control)
+    }
+
+    fn read_output(&self, port: &str) -> Result<crate::CoSimulationValue, EngineError> {
+        let (index, binding) = self.binding(port)?;
+        if binding.direction != crate::PinDirection::Output {
+            return Err(EngineError::new(
+                "ngspice_cosim_port_direction",
+                format!("ngspice co-simulation port `{port}` is not an output"),
+            ));
+        }
+        let output_index = self.bindings[..index]
+            .iter()
+            .filter(|candidate| candidate.direction == crate::PinDirection::Output)
+            .count();
+        let value = self
+            .session_ref()?
+            .outputs
+            .get(output_index)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::new("ngspice_cosim_protocol_error", "missing analog output")
+            })?;
+        Ok(crate::CoSimulationValue::Analog(value))
+    }
+
+    fn write_input(
+        &mut self,
+        port: &str,
+        time: crate::CoSimulationTime,
+        value: &crate::CoSimulationValue,
+        control: &ExecutionControl,
+    ) -> Result<bool, EngineError> {
+        let (index, binding) = self.binding(port)?;
+        if binding.direction != crate::PinDirection::Input {
+            return Err(EngineError::new(
+                "ngspice_cosim_port_direction",
+                format!("ngspice co-simulation port `{port}` is not an input"),
+            ));
+        }
+        let crate::CoSimulationValue::Analog(value) = value else {
+            return Err(EngineError::new(
+                "ngspice_cosim_domain_mismatch",
+                format!("ngspice co-simulation port `{port}` requires an analog value"),
+            ));
+        };
+        if !value.is_finite() {
+            return Err(EngineError::new(
+                "ngspice_cosim_value_invalid",
+                format!("ngspice co-simulation input `{port}` must be finite"),
+            ));
+        }
+        let input_index = self.bindings[..index]
+            .iter()
+            .filter(|candidate| candidate.direction == crate::PinDirection::Input)
+            .count();
+        let value = *value;
+        self.session_mut()?
+            .set_input(input_index, time, value, control)
+    }
+}
+
+struct CompiledNgSpiceCoSimulation {
+    netlist: String,
+    input_sources: Vec<String>,
+    output_vectors: Vec<String>,
+}
+
+fn compile_cosim_netlist(
+    circuit: &Circuit,
+    config: &NgSpiceCoSimulationConfig,
+    bindings: &[NgSpiceCoSimulationBinding],
+) -> Result<CompiledNgSpiceCoSimulation, EngineError> {
+    let topology = Topology::build(circuit)?;
+    let model_registry = compile_models(&circuit.models)?;
+    let mut lines = vec!["OntologyX Sim R9.3 SharedSpice co-simulation".to_owned()];
+    if !model_registry.netlist.is_empty() {
+        lines.extend(model_registry.netlist.iter().cloned());
+    }
+    for (index, component) in circuit.components.iter().enumerate() {
+        if component.kind == ComponentKind::ground() {
+            continue;
+        }
+        lines.push(compile_component(
+            index,
+            component,
+            &topology,
+            &model_registry,
+        )?);
+    }
+
+    let mut input_sources = Vec::new();
+    let mut output_vectors = Vec::new();
+    for binding in bindings {
+        let node = topology.net_nodes.get(&binding.net).ok_or_else(|| {
+            EngineError::new(
+                "ngspice_cosim_binding_invalid",
+                format!("unknown analog net `{}`", binding.net),
+            )
+        })?;
+        match binding.direction {
+            crate::PinDirection::Input => {
+                if node == "0" {
+                    return Err(EngineError::new(
+                        "ngspice_cosim_binding_invalid",
+                        format!(
+                            "external voltage input `{}` cannot drive ground",
+                            binding.port
+                        ),
+                    ));
+                }
+                let source = format!("Voxsim_ext_{}", input_sources.len());
+                lines.push(format!("{source} {node} 0 dc 0 external"));
+                input_sources.push(source.to_ascii_lowercase());
+            }
+            crate::PinDirection::Output => output_vectors.push(format!("v({node})")),
+            _ => unreachable!("binding direction validated"),
+        }
+    }
+    if output_vectors.is_empty() {
+        return Err(EngineError::new(
+            "ngspice_cosim_binding_invalid",
+            "ngspice co-simulation requires at least one output binding",
+        ));
+    }
+    let step = config.internal_step.as_seconds();
+    let stop = config.stop.as_seconds();
+    lines.push(format!(".tran {step:.17e} {stop:.17e}"));
+    lines.push(".end".to_owned());
+    lines.push(String::new());
+    Ok(CompiledNgSpiceCoSimulation {
+        netlist: lines.join("\n"),
+        input_sources,
+        output_vectors,
+    })
+}
+
+struct NgSpiceCoSimulationSession {
+    _run_dir: TempRunDir,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Receiver<Result<String, String>>,
+    current_time: crate::CoSimulationTime,
+    inputs: Vec<f64>,
+    outputs: Vec<f64>,
+}
+
+impl NgSpiceCoSimulationSession {
+    fn spawn(
+        config: &NgSpiceCoSimulationConfig,
+        compiled: &CompiledNgSpiceCoSimulation,
+        control: &ExecutionControl,
+    ) -> Result<Self, EngineError> {
+        check_ngspice_cosim_control(control)?;
+        let run_dir = TempRunDir::create().map_err(|error| {
+            EngineError::new(
+                "ngspice_tempdir_failed",
+                format!("could not create SharedSpice co-simulation run directory: {error}"),
+            )
+        })?;
+        let netlist_path = run_dir.path().join("cosim.cir");
+        fs::write(&netlist_path, compiled.netlist.as_bytes()).map_err(|error| {
+            EngineError::new(
+                "ngspice_netlist_write_failed",
+                format!("could not write SharedSpice co-simulation netlist: {error}"),
+            )
+        })?;
+        let mut command = Command::new(&config.helper);
+        command
+            .arg("--netlist")
+            .arg(&netlist_path)
+            .current_dir(run_dir.path())
+            .env("HOME", run_dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        for source in &compiled.input_sources {
+            command.arg("--input-source").arg(source);
+        }
+        for vector in &compiled.output_vectors {
+            command.arg("--output-vector").arg(vector);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            EngineError::new(
+                if error.kind() == io::ErrorKind::NotFound {
+                    "ngspice_cosim_helper_not_found"
+                } else {
+                    "ngspice_cosim_helper_spawn_failed"
+                },
+                format!(
+                    "could not execute ngspice co-simulation helper `{}`: {error}",
+                    config.helper.display()
+                ),
+            )
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            EngineError::new(
+                "ngspice_cosim_protocol_error",
+                "ngspice helper has no stdin pipe",
+            )
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            EngineError::new(
+                "ngspice_cosim_protocol_error",
+                "ngspice helper has no stdout pipe",
+            )
+        })?;
+        let mut session = Self {
+            _run_dir: run_dir,
+            child,
+            stdin,
+            stdout: spawn_cosim_protocol_reader(stdout),
+            current_time: crate::CoSimulationTime::ZERO,
+            inputs: vec![0.0; compiled.input_sources.len()],
+            outputs: vec![0.0; compiled.output_vectors.len()],
+        };
+        session.read_state(compiled.output_vectors.len(), control)?;
+        if session.current_time != crate::CoSimulationTime::ZERO {
+            return Err(EngineError::new(
+                "ngspice_cosim_time_origin",
+                "SharedSpice co-simulation helper must initialize at time zero",
+            ));
+        }
+        Ok(session)
+    }
+
+    fn set_input(
+        &mut self,
+        index: usize,
+        time: crate::CoSimulationTime,
+        value: f64,
+        control: &ExecutionControl,
+    ) -> Result<bool, EngineError> {
+        if time != self.current_time {
+            return Err(EngineError::new(
+                "ngspice_cosim_time_invalid",
+                "ngspice co-simulation input writes must occur at the participant current time",
+            ));
+        }
+        let previous = *self.inputs.get(index).ok_or_else(|| {
+            EngineError::new(
+                "ngspice_cosim_protocol_error",
+                "invalid external input index",
+            )
+        })?;
+        if previous.to_bits() == value.to_bits() {
+            return Ok(false);
+        }
+        self.send_command(&format!("SET {index} {value:.17e}"), control)?;
+        self.inputs[index] = value;
+        Ok(true)
+    }
+
+    fn advance_to(
+        &mut self,
+        target: crate::CoSimulationTime,
+        control: &ExecutionControl,
+    ) -> Result<(), EngineError> {
+        if target < self.current_time {
+            return Err(EngineError::new(
+                "ngspice_cosim_time_invalid",
+                "ngspice co-simulation participant cannot move backwards in time",
+            ));
+        }
+        if target == self.current_time {
+            return Ok(());
+        }
+        self.send_command(&format!("ADV {}", target.as_picoseconds()), control)?;
+        if self.current_time != target {
+            return Err(EngineError::new(
+                "ngspice_cosim_protocol_error",
+                format!(
+                    "ngspice helper advanced to {} ps instead of {} ps",
+                    self.current_time.as_picoseconds(),
+                    target.as_picoseconds()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn send_command(
+        &mut self,
+        command: &str,
+        control: &ExecutionControl,
+    ) -> Result<(), EngineError> {
+        check_ngspice_cosim_control(control)?;
+        writeln!(self.stdin, "{command}")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| {
+                EngineError::new(
+                    "ngspice_cosim_protocol_error",
+                    format!("could not write to ngspice helper: {error}"),
+                )
+            })?;
+        let count = self.outputs.len();
+        self.read_state(count, control)
+    }
+
+    fn read_state(
+        &mut self,
+        output_count: usize,
+        control: &ExecutionControl,
+    ) -> Result<(), EngineError> {
+        check_ngspice_cosim_control(control)?;
+        let Some(line) = recv_cosim_protocol_line(&self.stdout, control, "ngspice")? else {
+            let status = self.child.try_wait().ok().flatten();
+            return Err(EngineError::new(
+                "ngspice_cosim_helper_exited",
+                format!(
+                    "ngspice co-simulation helper closed its protocol stream (status: {status:?})"
+                ),
+            ));
+        };
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("STATE") {
+            return Err(EngineError::new(
+                "ngspice_cosim_protocol_error",
+                format!(
+                    "expected `STATE` from ngspice helper, got `{}`",
+                    line.trim()
+                ),
+            ));
+        }
+        let time = fields
+            .next()
+            .and_then(|field| field.parse::<u64>().ok())
+            .ok_or_else(|| {
+                EngineError::new(
+                    "ngspice_cosim_protocol_error",
+                    "invalid ngspice helper time",
+                )
+            })?;
+        let mut outputs = Vec::with_capacity(output_count);
+        for _ in 0..output_count {
+            let value = fields
+                .next()
+                .and_then(|field| field.parse::<f64>().ok())
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    EngineError::new(
+                        "ngspice_cosim_protocol_error",
+                        format!("invalid ngspice analog output `{}`", line.trim()),
+                    )
+                })?;
+            outputs.push(value);
+        }
+        if fields.next().is_some() {
+            return Err(EngineError::new(
+                "ngspice_cosim_protocol_error",
+                format!(
+                    "ngspice helper returned extra state fields: `{}`",
+                    line.trim()
+                ),
+            ));
+        }
+        self.current_time = crate::CoSimulationTime::from_picoseconds(time);
+        self.outputs = outputs;
+        Ok(())
+    }
+}
+
+fn spawn_cosim_protocol_reader(stdout: ChildStdout) -> Receiver<Result<String, String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
+}
+
+fn recv_cosim_protocol_line(
+    receiver: &Receiver<Result<String, String>>,
+    control: &ExecutionControl,
+    backend: &str,
+) -> Result<Option<String>, EngineError> {
+    control.policy.validate()?;
+    let started = Instant::now();
+    let poll = Duration::from_millis(control.policy.poll_interval_ms);
+    loop {
+        if control.cancellation.is_cancelled() {
+            return Err(EngineError::new(
+                "execution_cancelled",
+                format!("{backend} co-simulation was cancelled while waiting for backend state"),
+            ));
+        }
+        let wait = if control.policy.timeout_ms == 0 {
+            poll
+        } else {
+            let limit = Duration::from_millis(control.policy.timeout_ms);
+            if started.elapsed() >= limit {
+                return Err(EngineError::new(
+                    "execution_timeout",
+                    format!(
+                        "{backend} co-simulation backend did not respond within {} ms",
+                        control.policy.timeout_ms
+                    ),
+                ));
+            }
+            poll.min(limit.saturating_sub(started.elapsed()))
+        };
+        match receiver.recv_timeout(wait) {
+            Ok(Ok(line)) => return Ok(Some(line)),
+            Ok(Err(error)) => {
+                return Err(EngineError::new(
+                    if backend == "Renode" {
+                        "renode_cosim_protocol_error"
+                    } else {
+                        "ngspice_cosim_protocol_error"
+                    },
+                    format!("could not read {backend} co-simulation helper state: {error}"),
+                ));
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
+impl Drop for NgSpiceCoSimulationSession {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdin, "QUIT");
+        let _ = self.stdin.flush();
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            _ => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+}
+
+fn check_ngspice_cosim_control(control: &ExecutionControl) -> Result<(), EngineError> {
+    control.policy.validate()?;
+    if control.cancellation.is_cancelled() {
+        return Err(EngineError::new(
+            "execution_cancelled",
+            "ngspice co-simulation was cancelled",
+        ));
+    }
+    Ok(())
 }

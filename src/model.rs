@@ -29,6 +29,8 @@ impl From<String> for ModelId {
 #[serde(rename_all = "snake_case")]
 pub enum ModelLanguage {
     Spice,
+    Verilog,
+    SystemVerilog,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -36,6 +38,7 @@ pub enum ModelLanguage {
 pub enum ModelKind {
     Device,
     Subcircuit,
+    Module,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -44,7 +47,8 @@ pub struct ModelDefinition {
     pub language: ModelLanguage,
     pub kind: ModelKind,
     /// Symbol used by the simulator when instantiating this model, for example
-    /// `1N4148` for `.model 1N4148 D (...)` or `LM358` for `.subckt LM358 ...`.
+    /// `1N4148` for `.model 1N4148 D (...)`, `LM358` for `.subckt LM358 ...`,
+    /// or the top-level module name for Verilog/SystemVerilog module models.
     pub entry: String,
     /// Inline model source. Engine adapters validate this source before it is
     /// admitted to an isolated simulator process.
@@ -75,6 +79,34 @@ impl ModelDefinition {
             id: id.into(),
             language: ModelLanguage::Spice,
             kind: ModelKind::Subcircuit,
+            entry: entry.into(),
+            source: source.into(),
+        }
+    }
+
+    pub fn verilog_module(
+        id: impl Into<ModelId>,
+        entry: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            language: ModelLanguage::Verilog,
+            kind: ModelKind::Module,
+            entry: entry.into(),
+            source: source.into(),
+        }
+    }
+
+    pub fn system_verilog_module(
+        id: impl Into<ModelId>,
+        entry: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            language: ModelLanguage::SystemVerilog,
+            kind: ModelKind::Module,
             entry: entry.into(),
             source: source.into(),
         }

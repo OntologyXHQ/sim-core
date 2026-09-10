@@ -242,6 +242,13 @@ pub trait SimulationEngine: Send + Sync {
         }
     }
 
+    /// Request-aware capability hook used when multiple engines share an analysis kind.
+    /// Backends with component-specific ownership (for example Verilator HDL blocks)
+    /// should override this rather than relying on registration order.
+    fn supports_request(&self, request: &SimulationRequest) -> bool {
+        self.capabilities().supports(&request.analysis)
+    }
+
     fn simulate(&self, request: &SimulationRequest) -> Result<SimulationResult, EngineError>;
 
     /// Controlled execution surface. In-process engines may use the default
@@ -263,7 +270,7 @@ pub trait SimulationEngine: Send + Sync {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EngineRegistry {
     engines: Vec<Arc<dyn SimulationEngine>>,
 }
@@ -292,6 +299,13 @@ impl EngineRegistry {
         self.engines
             .iter()
             .find(|engine| engine.capabilities().supports(analysis))
+            .cloned()
+    }
+
+    pub fn select_request(&self, request: &SimulationRequest) -> Option<Arc<dyn SimulationEngine>> {
+        self.engines
+            .iter()
+            .find(|engine| engine.supports_request(request))
             .cloned()
     }
 }
@@ -341,7 +355,7 @@ impl fmt::Display for SimulationError {
 }
 impl std::error::Error for SimulationError {}
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Simulator {
     registry: EngineRegistry,
 }
@@ -383,7 +397,7 @@ impl Simulator {
         if !report.is_valid() {
             return Err(SimulationError::InvalidCircuit { report });
         }
-        let Some(engine) = self.registry.select(&request.analysis) else {
+        let Some(engine) = self.registry.select_request(request) else {
             return Err(SimulationError::NoCompatibleEngine {
                 analysis: request.analysis.kind(),
             });

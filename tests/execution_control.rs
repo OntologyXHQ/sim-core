@@ -133,11 +133,14 @@ mod unix_process_control {
         fs,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
+
+    static TEMP_EXECUTABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct TempExecutable {
         dir: PathBuf,
@@ -150,8 +153,9 @@ mod unix_process_control {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            let counter = TEMP_EXECUTABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "ontologyx-sim-core-execution-test-{}-{nonce}",
+                "ontologyx-sim-core-execution-test-{}-{nonce}-{counter}",
                 std::process::id()
             ));
             fs::create_dir(&dir).unwrap();

@@ -1,9 +1,9 @@
 [package]
 name = "ontologyx-sim-core"
-version = "0.8.0"
+version = "0.17.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Pure Rust electronics simulation core for analog, digital, and mixed-signal systems"
+description = "Rust electronics simulation core for analog, digital, mixed-signal, HDL, and firmware systems"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/ontologyx-sim-core"
@@ -12,9 +12,27 @@ homepage = "https://github.com/ontologyxhq/sim-core"
 keywords = ["electronics", "simulation", "circuit", "spice", "digital"]
 categories = ["science"]
 
+[features]
+default = []
+service = ["dep:axum", "dep:serde_json", "dep:tokio"]
+production = ["dep:serde_json", "dep:sha2", "dep:tokio"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-
+axum = { version = "=0.8.9", features = ["json", "ws"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "=1.49.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"], optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
+
+[[bin]]
+name = "sim-service"
+path = "src/bin/sim-service.rs"
+required-features = ["service"]
+
+[[bin]]
+name = "sim-worker"
+path = "src/bin/sim-worker.rs"
+required-features = ["production"]

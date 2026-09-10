@@ -141,6 +141,18 @@ impl ComponentKind {
     pub fn counter() -> Self {
         Self::new("counter")
     }
+    pub fn adc_bridge() -> Self {
+        Self::new("adc_bridge")
+    }
+    pub fn dac_bridge() -> Self {
+        Self::new("dac_bridge")
+    }
+    pub fn hdl_module() -> Self {
+        Self::new("hdl_module")
+    }
+    pub fn mcu() -> Self {
+        Self::new("mcu")
+    }
     pub fn diode() -> Self {
         Self::new("diode")
     }

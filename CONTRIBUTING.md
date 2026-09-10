@@ -10,3 +10,5 @@ Before opening a pull request, run:
 
 Core changes must preserve solver-independent public contracts. UI, graph editing,
 Node bindings, application persistence, and OXSim product behavior belong outside this repository.
+
+Production-runtime changes must keep `cargo test --features production --test r8_complete` clean and must not weaken worker isolation or execution limits.

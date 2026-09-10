@@ -9,6 +9,8 @@ pub enum AnalysisKind {
     AcSweep,
     DigitalTransient,
     MixedSignalTransient,
+    FirmwareTransient,
+    CoSimulationTransient,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -54,6 +56,10 @@ pub enum Analysis {
         step: f64,
         stop: f64,
     },
+    FirmwareTransient {
+        step: f64,
+        stop: f64,
+    },
 }
 
 impl Analysis {
@@ -65,6 +71,7 @@ impl Analysis {
             Self::AcSweep { .. } => AnalysisKind::AcSweep,
             Self::DigitalTransient { .. } => AnalysisKind::DigitalTransient,
             Self::MixedSignalTransient { .. } => AnalysisKind::MixedSignalTransient,
+            Self::FirmwareTransient { .. } => AnalysisKind::FirmwareTransient,
         }
     }
 
@@ -72,6 +79,7 @@ impl Analysis {
         match self {
             Self::DigitalTransient { .. } => AnalysisDomain::Digital,
             Self::MixedSignalTransient { .. } => AnalysisDomain::Mixed,
+            Self::FirmwareTransient { .. } => AnalysisDomain::Digital,
             _ => AnalysisDomain::Analog,
         }
     }
